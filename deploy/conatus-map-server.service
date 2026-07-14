@@ -1,0 +1,30 @@
+# Conatus Map-Server (VPS). Installation: sudo bash deploy/setup.sh
+[Unit]
+Description=Conatus Map Download Server (maps.json + json.php + static .sd7)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=conatus
+Group=conatus
+# CONATUS_MAPS_DIR / CONATUS_PORT / CONATUS_MAP_SECRET / CONATUS_BASE_URL:
+EnvironmentFile=/etc/conatus-map-server.env
+WorkingDirectory=/opt/conatus-map-server
+Environment=PYTHONPATH=/opt/conatus-map-server
+ExecStart=/usr/bin/python3 -m map_server.server \
+    --maps-dir ${CONATUS_MAPS_DIR} \
+    --port ${CONATUS_PORT} \
+    --secret ${CONATUS_MAP_SECRET} \
+    --base-url ${CONATUS_BASE_URL}
+Restart=on-failure
+RestartSec=5
+
+# Haertung: Server liest nur Code + Maps-Verzeichnis, schreibt nirgends.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

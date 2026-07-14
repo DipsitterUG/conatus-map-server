@@ -1,0 +1,10 @@
+# Self-Update: holt origin/main und restartet den Server nur bei Aenderung.
+# Getaktet durch conatus-map-server-update.timer.
+[Unit]
+Description=Conatus Map Server self-update (git pull + restart on change)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/conatus-map-server/deploy/update.sh
