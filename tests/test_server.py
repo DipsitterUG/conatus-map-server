@@ -63,6 +63,8 @@ class ServerTestBase(unittest.TestCase):
             maps_dir, host="127.0.0.1", port=0,
             base_url=self.base_url, secret=self.secret,
         )
+        self.snapshots_dir = self.server.snapshots_dir
+        self.presence_dir = self.server.presence_dir
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -76,6 +78,21 @@ class ServerTestBase(unittest.TestCase):
     def _get(self, path: str) -> tuple[int, bytes]:
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}") as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            error.close()
+            return error.code, body
+
+    def _put(self, path: str, data: bytes, content_type: str = "text/plain") -> tuple[int, bytes]:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=data,
+            method="PUT",
+            headers={"Content-Type": content_type},
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
                 return response.status, response.read()
         except urllib.error.HTTPError as error:
             body = error.read()
@@ -121,6 +138,41 @@ class PlainServerTest(ServerTestBase):
         status, _ = self._get("/maps/..%2F..%2Fetc%2Fpasswd")
         self.assertEqual(status, 404)
 
+    def test_snapshot_put_get_roundtrip(self) -> None:
+        payload = b"schema=2\n[meta]\nmap_cell_id=map_0_0\n"
+        status, body = self._put("/snapshots/map_0_0", payload)
+        self.assertEqual(status, 200, body)
+        self.assertTrue((self.snapshots_dir / "map_0_0.txt").is_file())
+
+        status, body = self._get("/snapshots/map_0_0")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, payload)
+
+    def test_snapshot_rejects_bad_cell_id_and_empty_body(self) -> None:
+        self.assertEqual(self._put("/snapshots/..%2Fbad", b"schema=2\n")[0], 400)
+        self.assertEqual(self._put("/snapshots/map_0_0", b"")[0], 400)
+
+    def test_presence_put_get_and_expiry(self) -> None:
+        status, body = self._put(
+            "/presence/map_0_0",
+            json.dumps({"host_ip": "10.0.0.2", "host_port": 8452, "player_name": "PC1"}).encode(),
+            "application/json",
+        )
+        self.assertEqual(status, 200, body)
+        status, body = self._get("/presence/map_0_0")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertTrue(payload["hosted"])
+        self.assertEqual(payload["host_ip"], "10.0.0.2")
+        self.assertEqual(payload["host_port"], 8452)
+        self.assertEqual(payload["player_name"], "PC1")
+
+        saved = self.presence_dir / "map_0_0.json"
+        stale = json.loads(saved.read_text(encoding="utf-8"))
+        stale["updated_at"] = 1
+        saved.write_text(json.dumps(stale), encoding="utf-8")
+        self.assertFalse(json.loads(self._get("/presence/map_0_0")[1])["hosted"])
+
 
 class SecretAndBaseUrlTest(ServerTestBase):
     base_url = "http://maps.example.org:8605"
@@ -131,6 +183,8 @@ class SecretAndBaseUrlTest(ServerTestBase):
         self.assertEqual(self._get("/maps/cell-a1.sd7")[0], 404)
         self.assertEqual(self._get("/geheim123/maps.json")[0], 200)
         self.assertEqual(self._get("/geheim123/maps/cell-a1.sd7")[0], 200)
+        self.assertEqual(self._put("/snapshots/map_0_0", b"schema=2\n")[0], 404)
+        self.assertEqual(self._put("/geheim123/snapshots/map_0_0", b"schema=2\n")[0], 200)
         # Prefix muss exakt sein, kein Teilstring.
         self.assertEqual(self._get("/geheim123extra/maps.json")[0], 404)
 

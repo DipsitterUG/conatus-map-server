@@ -8,15 +8,17 @@ Wants=network-online.target
 Type=simple
 User=conatus
 Group=conatus
-# CONATUS_MAPS_DIR / CONATUS_PORT / CONATUS_MAP_SECRET / CONATUS_BASE_URL:
-EnvironmentFile=/etc/conatus-map-server.env
 WorkingDirectory=/opt/conatus-map-server
 Environment=PYTHONPATH=/opt/conatus-map-server
+Environment=CONATUS_SNAPSHOTS_DIR=/srv/conatus-maps/snapshots
+# CONATUS_MAPS_DIR / CONATUS_SNAPSHOTS_DIR / CONATUS_PORT / CONATUS_MAP_SECRET / CONATUS_BASE_URL:
+EnvironmentFile=/etc/conatus-map-server.env
 ExecStart=/usr/bin/python3 -m map_server.server \
     --maps-dir ${CONATUS_MAPS_DIR} \
     --port ${CONATUS_PORT} \
     --secret ${CONATUS_MAP_SECRET} \
-    --base-url ${CONATUS_BASE_URL}
+    --base-url ${CONATUS_BASE_URL} \
+    --snapshots-dir ${CONATUS_SNAPSHOTS_DIR}
 Restart=on-failure
 RestartSec=5
 
@@ -24,6 +26,7 @@ RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+ReadWritePaths=/srv/conatus-maps
 PrivateTmp=true
 
 [Install]

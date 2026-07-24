@@ -13,6 +13,8 @@ rsync) leben im Studio-Repo (`conatus-studio`, Modul `map_server`).
 | `/maps.json` | Launcher (Start-Sync) | `[{springname, filename, size, md5}]` |
 | `/json.php?category=map&springname=…` | Engine pr-downloader (`PRD_HTTP_SEARCH_URL`) | springfiles-Format (Vertrag: RecoilEngine `HttpDownloader.cpp` `ParseResult`) |
 | `/maps/<datei>` | beide | statisches Archiv |
+| `/snapshots/<cell_id>` | Launcher/Uploader | `GET`/`PUT` eines Zell-Snapshots (`text/plain`, last-writer-wins) |
+| `/presence/<cell_id>` | Launcher/Uploader | `GET`/`PUT` aktuelle Host-IP/Port mit kurzer TTL |
 
 Mit gesetztem Secret liegen alle Pfade unter `/<secret>/…`; Clients tragen
 nur die Basis-URL inkl. Secret ein (`map-server.txt`), die Endpunkte werden
@@ -56,3 +58,5 @@ Teil des Conatus-Workspace (Projekt-Kopf: `conatus-studio`). Bausteine
 `map-download-server` / `map-server-vps`; Betriebs-Doku im Studio unter
 `docs/map-server.md`. Bewusste MVP-Grenzen: Secret-Pfad statt echter Auth,
 HTTP ohne TLS (Upgrade-Pfad: Caddy/nginx davor + `CONATUS_BASE_URL`).
+Snapshot-Sync ist bewusst MVP-einfach: last-writer-wins, keine Historie, keine
+Merge-Logik, Presence nur als TTL-Hinweis statt Lease.

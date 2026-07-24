@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
@@ -9,6 +12,8 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 from map_server.index import INDEX_FILENAME, MapEntry, MapIndex
 
 DEFAULT_PORT = 8605
+MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024
+PRESENCE_TTL_SECONDS = 90
 
 
 def springfiles_result(entry: MapEntry, public_base: str) -> dict[str, object]:
@@ -28,19 +33,55 @@ def springfiles_result(entry: MapEntry, public_base: str) -> dict[str, object]:
     }
 
 
+_SAFE_CELL_ID = re.compile(r"^[A-Za-z0-9_.-]{1,96}$")
+
+
+def safe_cell_id(value: str) -> str | None:
+    if _SAFE_CELL_ID.fullmatch(value):
+        return value
+    return None
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp-{os.getpid()}-{time.time_ns()}")
+    try:
+        tmp.write_bytes(data)
+        tmp.replace(path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
 class MapServerHandler(BaseHTTPRequestHandler):
     # ThreadingHTTPServer-Attribute, von create_server gesetzt:
     #   self.server.map_index: MapIndex
     #   self.server.base_url: str | None   (oeffentliche Basis OHNE Secret-Anteil)
     #   self.server.secret: str | None     (Pfad-Prefix als Minimal-Zugriffsschutz)
+    #   self.server.snapshots_dir: Path
+    #   self.server.presence_dir: Path
 
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
+        self._handle_request()
+
+    def do_PUT(self) -> None:  # noqa: N802 (http.server API)
+        self._handle_request()
+
+    def do_DELETE(self) -> None:  # noqa: N802 (http.server API)
+        self._handle_request()
+
+    def _handle_request(self) -> None:
         try:
             self._route()
         except BrokenPipeError:
             pass
+        except ValueError as error:
+            self._send_json(400, {"error": str(error)})
 
     def _route(self) -> None:
         url = urlsplit(self.path)
@@ -59,7 +100,19 @@ class MapServerHandler(BaseHTTPRequestHandler):
             self._serve_search(parse_qs(url.query))
             return
         if path.startswith("/maps/"):
+            if self.command != "GET":
+                self._send_json(405, {"error": "method not allowed"})
+                return
             self._serve_map_file(unquote(path[len("/maps/"):]))
+            return
+        if path.startswith("/snapshots/"):
+            self._route_snapshot(unquote(path[len("/snapshots/"):]))
+            return
+        if path.startswith("/presence/"):
+            self._route_presence(unquote(path[len("/presence/"):]))
+            return
+        if self.command != "GET":
+            self._send_json(405, {"error": "method not allowed"})
             return
         self._send_json(404, {"error": "not found"})
 
@@ -106,6 +159,134 @@ class MapServerHandler(BaseHTTPRequestHandler):
             while chunk := handle.read(1 << 20):
                 self.wfile.write(chunk)
 
+    def _snapshot_path(self, cell_id: str) -> Path | None:
+        safe = safe_cell_id(cell_id)
+        if safe is None:
+            return None
+        return self.server.snapshots_dir / f"{safe}.txt"
+
+    def _presence_path(self, cell_id: str) -> Path | None:
+        safe = safe_cell_id(cell_id)
+        if safe is None:
+            return None
+        return self.server.presence_dir / f"{safe}.json"
+
+    def _read_body(self, limit: int) -> bytes:
+        length_text = self.headers.get("Content-Length")
+        if not length_text:
+            raise ValueError("Content-Length required")
+        try:
+            length = int(length_text)
+        except ValueError as error:
+            raise ValueError("invalid Content-Length") from error
+        if length < 0 or length > limit:
+            raise ValueError("request body too large")
+        return self.rfile.read(length)
+
+    def _route_snapshot(self, cell_id: str) -> None:
+        path = self._snapshot_path(cell_id)
+        if path is None:
+            self._send_json(400, {"error": "invalid cell id"})
+            return
+        if self.command == "GET":
+            self._serve_snapshot(cell_id, path)
+            return
+        if self.command == "PUT":
+            self._put_snapshot(cell_id, path)
+            return
+        self._send_json(405, {"error": "method not allowed"})
+
+    def _serve_snapshot(self, cell_id: str, path: Path) -> None:
+        if not path.is_file():
+            self._send_json(404, {"error": "snapshot not found", "cell_id": cell_id})
+            return
+        stat = path.stat()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(stat.st_size))
+        self.send_header("X-Conatus-Cell-ID", cell_id)
+        self.send_header("X-Conatus-Updated-At", str(int(stat.st_mtime)))
+        self.end_headers()
+        with path.open("rb") as handle:
+            while chunk := handle.read(1 << 20):
+                self.wfile.write(chunk)
+
+    def _put_snapshot(self, cell_id: str, path: Path) -> None:
+        body = self._read_body(MAX_SNAPSHOT_BYTES)
+        if not body.strip():
+            self._send_json(400, {"error": "empty snapshot", "cell_id": cell_id})
+            return
+        atomic_write(path, body)
+        self._send_json(200, {
+            "ok": True,
+            "cell_id": cell_id,
+            "size": len(body),
+            "updated_at": int(path.stat().st_mtime),
+        })
+
+    def _route_presence(self, cell_id: str) -> None:
+        path = self._presence_path(cell_id)
+        if path is None:
+            self._send_json(400, {"error": "invalid cell id"})
+            return
+        if self.command == "GET":
+            self._serve_presence(cell_id, path)
+            return
+        if self.command == "PUT":
+            self._put_presence(cell_id, path)
+            return
+        if self.command == "DELETE":
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            self._send_json(200, {"ok": True, "cell_id": cell_id, "hosted": False})
+            return
+        self._send_json(405, {"error": "method not allowed"})
+
+    def _serve_presence(self, cell_id: str, path: Path) -> None:
+        if not path.is_file():
+            self._send_json(200, {"cell_id": cell_id, "hosted": False})
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self._send_json(200, {"cell_id": cell_id, "hosted": False})
+            return
+        updated_at = int(payload.get("updated_at") or 0)
+        if int(time.time()) - updated_at > PRESENCE_TTL_SECONDS:
+            self._send_json(200, {"cell_id": cell_id, "hosted": False})
+            return
+        payload["cell_id"] = cell_id
+        payload["hosted"] = True
+        payload["ttl_seconds"] = PRESENCE_TTL_SECONDS
+        self._send_json(200, payload)
+
+    def _put_presence(self, cell_id: str, path: Path) -> None:
+        try:
+            payload = json.loads(self._read_body(16 * 1024).decode("utf-8"))
+        except json.JSONDecodeError as error:
+            raise ValueError("invalid JSON") from error
+        host_ip = str(payload.get("host_ip") or "").strip()
+        host_port = int(payload.get("host_port") or 0)
+        player_name = str(payload.get("player_name") or "").strip()[:64]
+        if not host_ip:
+            host_ip = self.client_address[0]
+        if host_port <= 0 or host_port > 65535:
+            self._send_json(400, {"error": "invalid host_port", "cell_id": cell_id})
+            return
+        stored = {
+            "cell_id": cell_id,
+            "hosted": True,
+            "host_ip": host_ip,
+            "host_port": host_port,
+            "player_name": player_name,
+            "updated_at": int(time.time()),
+        }
+        atomic_write(path, json.dumps(stored, sort_keys=True).encode("utf-8"))
+        stored["ttl_seconds"] = PRESENCE_TTL_SECONDS
+        self._send_json(200, stored)
+
     def _send_json(self, status: int, payload: object) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -124,23 +305,41 @@ def create_server(
     port: int = DEFAULT_PORT,
     base_url: str | None = None,
     secret: str | None = None,
+    snapshots_dir: Path | None = None,
+    presence_dir: Path | None = None,
 ) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), MapServerHandler)
     server.map_index = MapIndex(maps_dir)
     server.base_url = base_url.rstrip("/") if base_url else None
     server.secret = secret.strip("/") if secret else None
+    server.snapshots_dir = snapshots_dir or (maps_dir.parent / "snapshots")
+    server.presence_dir = presence_dir or (maps_dir.parent / "presence")
     return server
 
 
 def serve_maps(
     maps_dir: Path,
+    snapshots_dir: Path | None = None,
+    presence_dir: Path | None = None,
     host: str = "0.0.0.0",
     port: int = DEFAULT_PORT,
     base_url: str | None = None,
     secret: str | None = None,
 ) -> None:
     maps_dir.mkdir(parents=True, exist_ok=True)
-    server = create_server(maps_dir, host, port, base_url=base_url, secret=secret)
+    resolved_snapshots = snapshots_dir or (maps_dir.parent / "snapshots")
+    resolved_presence = presence_dir or (maps_dir.parent / "presence")
+    resolved_snapshots.mkdir(parents=True, exist_ok=True)
+    resolved_presence.mkdir(parents=True, exist_ok=True)
+    server = create_server(
+        maps_dir,
+        host,
+        port,
+        base_url=base_url,
+        secret=secret,
+        snapshots_dir=resolved_snapshots,
+        presence_dir=resolved_presence,
+    )
     entries = server.map_index.refresh()
     if not (maps_dir / INDEX_FILENAME).is_file():
         print(f"[map-server] HINWEIS: {maps_dir}/{INDEX_FILENAME} fehlt noch "
@@ -150,7 +349,8 @@ def serve_maps(
         print(f"[map-server]   {entry.springname} ({entry.filename}, {entry.size} bytes)", flush=True)
     prefix = ("/" + server.secret) if server.secret else ""
     print(f"[map-server] lauscht auf http://{host}:{port}{prefix} "
-          f"(maps.json | json.php?category=map&springname=... | maps/<datei>)", flush=True)
+          f"(maps.json | json.php?category=map&springname=... | maps/<datei> | "
+          f"snapshots/<cell> | presence/<cell>)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -163,6 +363,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="conatus-map-server")
     parser.add_argument("--maps-dir", type=Path, required=True,
                         help="Verzeichnis mit .sd7 + maps.json (rsync-Ziel von sync-map-server)")
+    parser.add_argument("--snapshots-dir", type=Path, default=None,
+                        help="Verzeichnis fuer zentrale Zell-Snapshots (Default: ../snapshots)")
+    parser.add_argument("--presence-dir", type=Path, default=None,
+                        help="Verzeichnis fuer kurzlebige Host-Presence (Default: ../presence)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--base-url", default=None,
@@ -170,7 +374,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--secret", default=None,
                         help="Pfad-Prefix als Minimal-Zugriffsschutz (Clients haengen ihn an die URL)")
     args = parser.parse_args(argv)
-    serve_maps(args.maps_dir, host=args.host, port=args.port,
+    serve_maps(args.maps_dir, snapshots_dir=args.snapshots_dir, presence_dir=args.presence_dir,
+               host=args.host, port=args.port,
                base_url=args.base_url, secret=args.secret)
     return 0
 
