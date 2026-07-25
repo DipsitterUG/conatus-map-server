@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from map_server.index import INDEX_FILENAME, MapEntry, MapIndex
+from map_server.relay import DEFAULT_PORT_RANGE, MAX_SCRIPT_BYTES, RelayManager
 
 DEFAULT_PORT = 8605
 MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024
@@ -122,6 +123,21 @@ class MapServerHandler(BaseHTTPRequestHandler):
             return
         if path.startswith("/presence/"):
             self._route_presence(unquote(path[len("/presence/"):]))
+            return
+        if path == "/relay/health":
+            if self.command != "GET":
+                self._send_json(405, {"error": "method not allowed"})
+                return
+            self._send_json(200, self.server.relay_manager.health())
+            return
+        if path == "/relay/sessions":
+            if self.command != "GET":
+                self._send_json(405, {"error": "method not allowed"})
+                return
+            self._send_json(200, self.server.relay_manager.list_sessions())
+            return
+        if path.startswith("/relay/sessions/"):
+            self._route_relay_session(unquote(path[len("/relay/sessions/"):]))
             return
         if path == "/logs":
             if self.command != "GET":
@@ -308,6 +324,34 @@ class MapServerHandler(BaseHTTPRequestHandler):
         stored["ttl_seconds"] = PRESENCE_TTL_SECONDS
         self._send_json(200, stored)
 
+    # Relay-Sessions (Baustein internet-hosting): der Launcher des initiierenden
+    # Spielers PUTtet das komplette Startscript; der Manager startet einen
+    # spring-dedicated-Prozess und antwortet mit dem UDP-Port. Beide Spieler
+    # verbinden sich dann als normale Clients (IsHost=0) zu <relay-host>:<port>.
+    def _route_relay_session(self, cell_id: str) -> None:
+        if safe_cell_id(cell_id) is None:
+            self._send_json(400, {"error": "invalid cell id"})
+            return
+        manager: RelayManager = self.server.relay_manager
+        if self.command == "PUT":
+            body = self._read_body(MAX_SCRIPT_BYTES)
+            try:
+                script_text = body.decode("utf-8")
+            except UnicodeDecodeError:
+                self._send_json(400, {"error": "script must be UTF-8", "cell_id": cell_id})
+                return
+            if not script_text.strip():
+                self._send_json(400, {"error": "empty script", "cell_id": cell_id})
+                return
+            status, payload = manager.start(cell_id, script_text)
+            self._send_json(status, payload)
+            return
+        if self.command == "DELETE":
+            status, payload = manager.stop(cell_id)
+            self._send_json(status, payload)
+            return
+        self._send_json(405, {"error": "method not allowed"})
+
     # Diagnose-Logs (Launcher + Engine infolog) pro Spieler, damit ein Agent oder
     # ein Mitspieler sie per GET nachvollziehen kann, ohne dass jemand sie manuell
     # von den Windows-PCs kopieren muss. Bewusst nur die letzten LOG_RUNS_PER_PLAYER
@@ -408,6 +452,9 @@ def create_server(
     snapshots_dir: Path | None = None,
     presence_dir: Path | None = None,
     logs_dir: Path | None = None,
+    relay_engine_dir: Path | None = None,
+    relay_run_dir: Path | None = None,
+    relay_ports: str = DEFAULT_PORT_RANGE,
 ) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), MapServerHandler)
     server.map_index = MapIndex(maps_dir)
@@ -416,6 +463,10 @@ def create_server(
     server.snapshots_dir = snapshots_dir or (maps_dir.parent / "snapshots")
     server.presence_dir = presence_dir or (maps_dir.parent / "presence")
     server.logs_dir = logs_dir or (maps_dir.parent / "logs")
+    server.relay_manager = RelayManager(
+        engine_dir=relay_engine_dir,
+        run_dir=relay_run_dir or (maps_dir.parent / "relay"),
+        port_range=relay_ports)
     return server
 
 
@@ -428,14 +479,19 @@ def serve_maps(
     port: int = DEFAULT_PORT,
     base_url: str | None = None,
     secret: str | None = None,
+    relay_engine_dir: Path | None = None,
+    relay_run_dir: Path | None = None,
+    relay_ports: str = DEFAULT_PORT_RANGE,
 ) -> None:
     maps_dir.mkdir(parents=True, exist_ok=True)
     resolved_snapshots = snapshots_dir or (maps_dir.parent / "snapshots")
     resolved_presence = presence_dir or (maps_dir.parent / "presence")
     resolved_logs = logs_dir or (maps_dir.parent / "logs")
+    resolved_relay_run = relay_run_dir or (maps_dir.parent / "relay")
     resolved_snapshots.mkdir(parents=True, exist_ok=True)
     resolved_presence.mkdir(parents=True, exist_ok=True)
     resolved_logs.mkdir(parents=True, exist_ok=True)
+    resolved_relay_run.mkdir(parents=True, exist_ok=True)
     server = create_server(
         maps_dir,
         host,
@@ -445,6 +501,9 @@ def serve_maps(
         snapshots_dir=resolved_snapshots,
         presence_dir=resolved_presence,
         logs_dir=resolved_logs,
+        relay_engine_dir=relay_engine_dir,
+        relay_run_dir=resolved_relay_run,
+        relay_ports=relay_ports,
     )
     entries = server.map_index.refresh()
     if not (maps_dir / INDEX_FILENAME).is_file():
@@ -456,7 +515,12 @@ def serve_maps(
     prefix = ("/" + server.secret) if server.secret else ""
     print(f"[map-server] lauscht auf http://{host}:{port}{prefix} "
           f"(maps.json | json.php?category=map&springname=... | maps/<datei> | "
-          f"snapshots/<cell> | presence/<cell> | logs | logs/<player>/<run>/<kind>)", flush=True)
+          f"snapshots/<cell> | presence/<cell> | logs | logs/<player>/<run>/<kind> | "
+          f"relay/health | relay/sessions[/<cell>])", flush=True)
+    relay_state = ("bereit, engine=" + str(relay_engine_dir)
+                   if server.relay_manager.dedicated_ready()
+                   else "OHNE dedicated-Binary (health meldet dedicated_ready=false)")
+    print(f"[map-server] relay: {relay_state}, ports={relay_ports}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -481,10 +545,19 @@ def main(argv: list[str] | None = None) -> int:
                         help="Oeffentliche Basis-URL ohne Secret (z.B. http://maps.example.org:8605)")
     parser.add_argument("--secret", default=None,
                         help="Pfad-Prefix als Minimal-Zugriffsschutz (Clients haengen ihn an die URL)")
+    parser.add_argument("--relay-engine-dir", type=Path, default=None,
+                        help="Verzeichnis mit spring-dedicated + base/ (fehlt es, meldet "
+                             "/relay/health dedicated_ready=false)")
+    parser.add_argument("--relay-run-dir", type=Path, default=None,
+                        help="Arbeitsverzeichnis der Relay-Sessions (Default: ../relay)")
+    parser.add_argument("--relay-ports", default=DEFAULT_PORT_RANGE,
+                        help=f"UDP-Portbereich fuer Relay-Sessions (Default: {DEFAULT_PORT_RANGE})")
     args = parser.parse_args(argv)
     serve_maps(args.maps_dir, snapshots_dir=args.snapshots_dir, presence_dir=args.presence_dir,
                logs_dir=args.logs_dir, host=args.host, port=args.port,
-               base_url=args.base_url, secret=args.secret)
+               base_url=args.base_url, secret=args.secret,
+               relay_engine_dir=args.relay_engine_dir, relay_run_dir=args.relay_run_dir,
+               relay_ports=args.relay_ports)
     return 0
 
 

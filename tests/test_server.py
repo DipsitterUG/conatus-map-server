@@ -66,6 +66,7 @@ class ServerTestBase(unittest.TestCase):
             # zielt in der Produktion auf ein Geschwisterverzeichnis von "maps/", trifft
             # hier aber das geteilte /tmp, weil maps_dir selbst schon das Tempdir ist.
             logs_dir=maps_dir / "logs",
+            relay_run_dir=maps_dir / "relay",
         )
         self.snapshots_dir = self.server.snapshots_dir
         self.presence_dir = self.server.presence_dir
