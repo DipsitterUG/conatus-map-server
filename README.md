@@ -15,6 +15,8 @@ rsync) leben im Studio-Repo (`conatus-studio`, Modul `map_server`).
 | `/maps/<datei>` | beide | statisches Archiv |
 | `/snapshots/<cell_id>` | Launcher/Uploader | `GET`/`PUT` eines Zell-Snapshots (`text/plain`, last-writer-wins) |
 | `/presence/<cell_id>` | Launcher/Uploader | `GET`/`PUT` aktuelle Host-IP/Port mit kurzer TTL |
+| `/logs` | Diagnose | `GET` Index: `{player: [{run_id, kinds}, ...]}`, neueste zuerst |
+| `/logs/<player>/<run_id>/<kind>` | Launcher/Diagnose | `GET`/`PUT` Log-Datei (`kind` = `launcher` \| `engine`), last-writer-wins pro Run, nur die letzten 3 Runs pro Spieler bleiben erhalten |
 
 Mit gesetztem Secret liegen alle Pfade unter `/<secret>/…`; Clients tragen
 nur die Basis-URL inkl. Secret ein (`map-server.txt`), die Endpunkte werden
@@ -59,4 +61,6 @@ Teil des Conatus-Workspace (Projekt-Kopf: `conatus-studio`). Bausteine
 `docs/map-server.md`. Bewusste MVP-Grenzen: Secret-Pfad statt echter Auth,
 HTTP ohne TLS (Upgrade-Pfad: Caddy/nginx davor + `CONATUS_BASE_URL`).
 Snapshot-Sync ist bewusst MVP-einfach: last-writer-wins, keine Historie, keine
-Merge-Logik, Presence nur als TTL-Hinweis statt Lease.
+Merge-Logik, Presence nur als TTL-Hinweis statt Lease. Logs genauso einfach:
+kein Auth ueber den Secret-Pfad hinaus, keine Redaction -- nur fuer den
+privaten Freundeskreis-Betrieb gedacht.

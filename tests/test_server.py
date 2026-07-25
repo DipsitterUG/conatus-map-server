@@ -62,9 +62,14 @@ class ServerTestBase(unittest.TestCase):
         self.server = create_server(
             maps_dir, host="127.0.0.1", port=0,
             base_url=self.base_url, secret=self.secret,
+            # Explizit isoliert im Test-Tempdir: der Default (maps_dir.parent / "logs")
+            # zielt in der Produktion auf ein Geschwisterverzeichnis von "maps/", trifft
+            # hier aber das geteilte /tmp, weil maps_dir selbst schon das Tempdir ist.
+            logs_dir=maps_dir / "logs",
         )
         self.snapshots_dir = self.server.snapshots_dir
         self.presence_dir = self.server.presence_dir
+        self.logs_dir = self.server.logs_dir
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -172,6 +177,39 @@ class PlainServerTest(ServerTestBase):
         stale["updated_at"] = 1
         saved.write_text(json.dumps(stale), encoding="utf-8")
         self.assertFalse(json.loads(self._get("/presence/map_0_0")[1])["hosted"])
+
+    def test_log_put_get_roundtrip(self) -> None:
+        status, body = self._put("/logs/PC1/20260725-100000/launcher", b"hello launcher log\n")
+        self.assertEqual(status, 200, body)
+        status, body = self._get("/logs/PC1/20260725-100000/launcher")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"hello launcher log\n")
+
+    def test_log_rejects_bad_segments_and_unknown_kind(self) -> None:
+        self.assertEqual(self._put("/logs/..%2Fbad/run/launcher", b"x")[0], 400)
+        self.assertEqual(self._put("/logs/PC1/..%2Fbad/launcher", b"x")[0], 400)
+        self.assertEqual(self._put("/logs/PC1/run/enginex", b"x")[0], 400)
+        self.assertEqual(self._get("/logs/PC1/does-not-exist/engine")[0], 404)
+
+    def test_log_index_lists_newest_run_first(self) -> None:
+        self._put("/logs/PC1/20260725-100000/launcher", b"first\n")
+        self._put("/logs/PC1/20260725-100100/launcher", b"second\n")
+        self._put("/logs/PC1/20260725-100100/engine", b"infolog\n")
+        status, body = self._get("/logs")
+        self.assertEqual(status, 200)
+        index = json.loads(body)
+        self.assertEqual(index["PC1"][0]["run_id"], "20260725-100100")
+        self.assertEqual(sorted(index["PC1"][0]["kinds"]), ["engine", "launcher"])
+        self.assertEqual(index["PC1"][1]["run_id"], "20260725-100000")
+
+    def test_log_keeps_only_last_three_runs_per_player(self) -> None:
+        for run_id in ("20260725-100000", "20260725-100100", "20260725-100200", "20260725-100300"):
+            self._put(f"/logs/PC1/{run_id}/launcher", run_id.encode())
+        remaining = sorted(p.name for p in (self.logs_dir / "PC1").iterdir())
+        self.assertEqual(
+            remaining,
+            ["20260725-100100", "20260725-100200", "20260725-100300"],
+        )
 
 
 class SecretAndBaseUrlTest(ServerTestBase):

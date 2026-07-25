@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,6 +15,9 @@ from map_server.index import INDEX_FILENAME, MapEntry, MapIndex
 DEFAULT_PORT = 8605
 MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024
 PRESENCE_TTL_SECONDS = 90
+MAX_LOG_BYTES = 8 * 1024 * 1024
+LOG_RUNS_PER_PLAYER = 3
+LOG_KINDS = ("launcher", "engine")
 
 
 def springfiles_result(entry: MapEntry, public_base: str) -> dict[str, object]:
@@ -34,10 +38,17 @@ def springfiles_result(entry: MapEntry, public_base: str) -> dict[str, object]:
 
 
 _SAFE_CELL_ID = re.compile(r"^[A-Za-z0-9_.-]{1,96}$")
+_SAFE_LOG_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
 def safe_cell_id(value: str) -> str | None:
     if _SAFE_CELL_ID.fullmatch(value):
+        return value
+    return None
+
+
+def safe_log_segment(value: str) -> str | None:
+    if _SAFE_LOG_SEGMENT.fullmatch(value):
         return value
     return None
 
@@ -63,6 +74,7 @@ class MapServerHandler(BaseHTTPRequestHandler):
     #   self.server.secret: str | None     (Pfad-Prefix als Minimal-Zugriffsschutz)
     #   self.server.snapshots_dir: Path
     #   self.server.presence_dir: Path
+    #   self.server.logs_dir: Path
 
     protocol_version = "HTTP/1.1"
 
@@ -110,6 +122,15 @@ class MapServerHandler(BaseHTTPRequestHandler):
             return
         if path.startswith("/presence/"):
             self._route_presence(unquote(path[len("/presence/"):]))
+            return
+        if path == "/logs":
+            if self.command != "GET":
+                self._send_json(405, {"error": "method not allowed"})
+                return
+            self._serve_log_index()
+            return
+        if path.startswith("/logs/"):
+            self._route_log_entry(unquote(path[len("/logs/"):]))
             return
         if self.command != "GET":
             self._send_json(405, {"error": "method not allowed"})
@@ -287,6 +308,85 @@ class MapServerHandler(BaseHTTPRequestHandler):
         stored["ttl_seconds"] = PRESENCE_TTL_SECONDS
         self._send_json(200, stored)
 
+    # Diagnose-Logs (Launcher + Engine infolog) pro Spieler, damit ein Agent oder
+    # ein Mitspieler sie per GET nachvollziehen kann, ohne dass jemand sie manuell
+    # von den Windows-PCs kopieren muss. Bewusst nur die letzten LOG_RUNS_PER_PLAYER
+    # Durchlaeufe pro Spieler (last-writer-wins wie Snapshots), keine Historie.
+    def _log_path(self, player: str, run_id: str, kind: str) -> Path | None:
+        safe_player = safe_log_segment(player)
+        safe_run = safe_log_segment(run_id)
+        if safe_player is None or safe_run is None or kind not in LOG_KINDS:
+            return None
+        return self.server.logs_dir / safe_player / safe_run / f"{kind}.log"
+
+    def _route_log_entry(self, rest: str) -> None:
+        parts = rest.split("/")
+        if len(parts) != 3:
+            self._send_json(400, {"error": "expected /logs/<player>/<run_id>/<kind>"})
+            return
+        player, run_id, kind = parts
+        path = self._log_path(player, run_id, kind)
+        if path is None:
+            self._send_json(400, {"error": "invalid player, run_id or kind"})
+            return
+        if self.command == "GET":
+            self._serve_log(path)
+            return
+        if self.command == "PUT":
+            self._put_log(player, run_id, path)
+            return
+        self._send_json(405, {"error": "method not allowed"})
+
+    def _serve_log(self, path: Path) -> None:
+        if not path.is_file():
+            self._send_json(404, {"error": "log not found"})
+            return
+        stat = path.stat()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(stat.st_size))
+        self.send_header("X-Conatus-Updated-At", str(int(stat.st_mtime)))
+        self.end_headers()
+        with path.open("rb") as handle:
+            while chunk := handle.read(1 << 20):
+                self.wfile.write(chunk)
+
+    def _put_log(self, player: str, run_id: str, path: Path) -> None:
+        body = self._read_body(MAX_LOG_BYTES)
+        atomic_write(path, body)
+        self._prune_old_runs(player)
+        self._send_json(200, {"ok": True, "player": player, "run_id": run_id, "size": len(body)})
+
+    def _prune_old_runs(self, player: str) -> None:
+        player_dir = self.server.logs_dir / player
+        if not player_dir.is_dir():
+            return
+        runs = sorted(
+            (entry for entry in player_dir.iterdir() if entry.is_dir()),
+            key=lambda entry: entry.name,
+            reverse=True,
+        )
+        for stale in runs[LOG_RUNS_PER_PLAYER:]:
+            shutil.rmtree(stale, ignore_errors=True)
+
+    def _serve_log_index(self) -> None:
+        logs_dir: Path = self.server.logs_dir
+        index: dict[str, list[dict[str, object]]] = {}
+        if logs_dir.is_dir():
+            for player_dir in sorted(p for p in logs_dir.iterdir() if p.is_dir()):
+                runs = []
+                for run_dir in sorted(
+                    (entry for entry in player_dir.iterdir() if entry.is_dir()),
+                    key=lambda entry: entry.name,
+                    reverse=True,
+                ):
+                    kinds = sorted(p.stem for p in run_dir.glob("*.log"))
+                    if kinds:
+                        runs.append({"run_id": run_dir.name, "kinds": kinds})
+                if runs:
+                    index[player_dir.name] = runs
+        self._send_json(200, index)
+
     def _send_json(self, status: int, payload: object) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -307,6 +407,7 @@ def create_server(
     secret: str | None = None,
     snapshots_dir: Path | None = None,
     presence_dir: Path | None = None,
+    logs_dir: Path | None = None,
 ) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), MapServerHandler)
     server.map_index = MapIndex(maps_dir)
@@ -314,6 +415,7 @@ def create_server(
     server.secret = secret.strip("/") if secret else None
     server.snapshots_dir = snapshots_dir or (maps_dir.parent / "snapshots")
     server.presence_dir = presence_dir or (maps_dir.parent / "presence")
+    server.logs_dir = logs_dir or (maps_dir.parent / "logs")
     return server
 
 
@@ -321,6 +423,7 @@ def serve_maps(
     maps_dir: Path,
     snapshots_dir: Path | None = None,
     presence_dir: Path | None = None,
+    logs_dir: Path | None = None,
     host: str = "0.0.0.0",
     port: int = DEFAULT_PORT,
     base_url: str | None = None,
@@ -329,8 +432,10 @@ def serve_maps(
     maps_dir.mkdir(parents=True, exist_ok=True)
     resolved_snapshots = snapshots_dir or (maps_dir.parent / "snapshots")
     resolved_presence = presence_dir or (maps_dir.parent / "presence")
+    resolved_logs = logs_dir or (maps_dir.parent / "logs")
     resolved_snapshots.mkdir(parents=True, exist_ok=True)
     resolved_presence.mkdir(parents=True, exist_ok=True)
+    resolved_logs.mkdir(parents=True, exist_ok=True)
     server = create_server(
         maps_dir,
         host,
@@ -339,6 +444,7 @@ def serve_maps(
         secret=secret,
         snapshots_dir=resolved_snapshots,
         presence_dir=resolved_presence,
+        logs_dir=resolved_logs,
     )
     entries = server.map_index.refresh()
     if not (maps_dir / INDEX_FILENAME).is_file():
@@ -350,7 +456,7 @@ def serve_maps(
     prefix = ("/" + server.secret) if server.secret else ""
     print(f"[map-server] lauscht auf http://{host}:{port}{prefix} "
           f"(maps.json | json.php?category=map&springname=... | maps/<datei> | "
-          f"snapshots/<cell> | presence/<cell>)", flush=True)
+          f"snapshots/<cell> | presence/<cell> | logs | logs/<player>/<run>/<kind>)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -367,6 +473,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Verzeichnis fuer zentrale Zell-Snapshots (Default: ../snapshots)")
     parser.add_argument("--presence-dir", type=Path, default=None,
                         help="Verzeichnis fuer kurzlebige Host-Presence (Default: ../presence)")
+    parser.add_argument("--logs-dir", type=Path, default=None,
+                        help="Verzeichnis fuer Diagnose-Logs pro Spieler (Default: ../logs)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--base-url", default=None,
@@ -375,7 +483,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="Pfad-Prefix als Minimal-Zugriffsschutz (Clients haengen ihn an die URL)")
     args = parser.parse_args(argv)
     serve_maps(args.maps_dir, snapshots_dir=args.snapshots_dir, presence_dir=args.presence_dir,
-               host=args.host, port=args.port,
+               logs_dir=args.logs_dir, host=args.host, port=args.port,
                base_url=args.base_url, secret=args.secret)
     return 0
 

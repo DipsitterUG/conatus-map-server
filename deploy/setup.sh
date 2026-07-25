@@ -9,6 +9,7 @@ set -euo pipefail
 REPO_DIR="/opt/conatus-map-server"
 MAPS_DIR="/srv/conatus-maps/maps"
 SNAPSHOTS_DIR="/srv/conatus-maps/snapshots"
+LOGS_DIR="/srv/conatus-maps/logs"
 ENV_FILE="/etc/conatus-map-server.env"
 
 if [[ $EUID -ne 0 ]]; then
@@ -23,7 +24,7 @@ command -v rsync >/dev/null || apt-get install -y rsync
 # Service-Nutzer (login-los); rsync vom Laptop laeuft ueber diesen Account.
 id -u conatus >/dev/null 2>&1 || adduser --disabled-password --gecos "" conatus
 
-mkdir -p "$MAPS_DIR" "$SNAPSHOTS_DIR"
+mkdir -p "$MAPS_DIR" "$SNAPSHOTS_DIR" "$LOGS_DIR"
 chown -R conatus:conatus /srv/conatus-maps
 
 if [[ ! -d "$REPO_DIR/.git" ]]; then
@@ -35,13 +36,17 @@ if [[ ! -f "$ENV_FILE" ]]; then
 	cat > "$ENV_FILE" <<EOF
 CONATUS_MAPS_DIR=$MAPS_DIR
 CONATUS_SNAPSHOTS_DIR=$SNAPSHOTS_DIR
+CONATUS_LOGS_DIR=$LOGS_DIR
 CONATUS_PORT=8605
 CONATUS_MAP_SECRET=$(openssl rand -hex 16)
 CONATUS_BASE_URL=
 EOF
 	chmod 600 "$ENV_FILE"
-elif ! grep -q '^CONATUS_SNAPSHOTS_DIR=' "$ENV_FILE"; then
-	printf '\nCONATUS_SNAPSHOTS_DIR=%s\n' "$SNAPSHOTS_DIR" >> "$ENV_FILE"
+else
+	grep -q '^CONATUS_SNAPSHOTS_DIR=' "$ENV_FILE" \
+		|| printf '\nCONATUS_SNAPSHOTS_DIR=%s\n' "$SNAPSHOTS_DIR" >> "$ENV_FILE"
+	grep -q '^CONATUS_LOGS_DIR=' "$ENV_FILE" \
+		|| printf '\nCONATUS_LOGS_DIR=%s\n' "$LOGS_DIR" >> "$ENV_FILE"
 fi
 
 cp "$REPO_DIR/deploy/conatus-map-server.service" /etc/systemd/system/
