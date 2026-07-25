@@ -17,6 +17,9 @@ rsync) leben im Studio-Repo (`conatus-studio`, Modul `map_server`).
 | `/presence/<cell_id>` | Launcher/Uploader | `GET`/`PUT` aktuelle Host-IP/Port mit kurzer TTL |
 | `/logs` | Diagnose | `GET` Index: `{player: [{run_id, kinds}, ...]}`, neueste zuerst |
 | `/logs/<player>/<run_id>/<kind>` | Launcher/Diagnose | `GET`/`PUT` Log-Datei (`kind` = `launcher` \| `engine`), last-writer-wins pro Run, nur die letzten 3 Runs pro Spieler bleiben erhalten |
+| `/relay/health` | Launcher (Status-Indikator) | `GET` `{ok, dedicated_ready, active_sessions, ports_free}` |
+| `/relay/sessions` | Diagnose | `GET` Liste laufender Relay-Sessions |
+| `/relay/sessions/<cell_id>` | Launcher (internet-hosting) | `PUT` Startscript (Marker `HostPort=0;`) -> spawnt `spring-dedicated`, Antwort mit UDP-Port; `DELETE` stoppt |
 
 Mit gesetztem Secret liegen alle Pfade unter `/<secret>/…`; Clients tragen
 nur die Basis-URL inkl. Secret ein (`map-server.txt`), die Endpunkte werden
@@ -46,6 +49,23 @@ PYTHONPATH=src python3 -m conatus_studio.cli sync-map-server \
 
 Der Server liest ausschliesslich das mitgespiegelte `maps.json`
 (Index-Datei-Modus) und uebernimmt Aenderungen ohne Neustart.
+
+### Relay (internet-hosting)
+
+Der Relay-Manager spawnt pro MapCell einen `spring-dedicated`-Prozess
+(reduced mode: keine Spiel-/Map-Archive noetig, `MapHash`/`ModHash` kommen im
+Startscript). Engine-Paket installieren/aktualisieren:
+
+```bash
+sudo bash /opt/conatus-map-server/deploy/setup-relay.sh /pfad/zu/recoil-linux-dedicated.tar.gz
+# oder mit GitHub-Token direkt vom Release engine-linux-dedicated-current:
+sudo CONATUS_GH_TOKEN=... bash /opt/conatus-map-server/deploy/setup-relay.sh
+```
+
+Ohne Engine-Paket meldet `/relay/health` `dedicated_ready=false` (Indikator
+auf den Clients wird rot). Die UDP-Session-Ports (Default 8452-8461) muessen
+eingehend offen sein; das HTTP-Secret schuetzt nur die Manager-API, die
+UDP-Ports selbst sind offen (MVP-Grenze, wie bisher beim Spieler-Host).
 
 ## Lokal testen
 
