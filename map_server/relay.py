@@ -32,6 +32,38 @@ DEFAULT_MAX_AGE_SECONDS = 6 * 3600
 SPAWN_GRACE_SECONDS = 1.0
 DEDICATED_BINARY = "spring-dedicated"
 
+# Explizite Config pro Session. Das dedicated-Binary hat eigene Defaults
+# (ConfigVariable.dedicatedValue in der Engine), die von der normalen Engine
+# abweichen -- beide hier gesetzten Werte sind genau solche Faelle:
+#
+#  * AllowSpectatorJoin: defaultValue(true), aber dedicatedValue(FALSE).
+#    Ohne diesen Wert weist der Server jeden Client ab, dessen Name nicht im
+#    Startscript steht ("User name not authorized to connect", GameServer.cpp).
+#    Unser Script kennt nur den Initiator als PLAYER0 -- der Async-Flow laesst
+#    Gaeste bewusst spaeter und unter unbekanntem Namen dazukommen, sie werden
+#    als "~Name"-Spectator aufgenommen und vom guest_promotion-Gadget befoerdert.
+#    Beim lokalen IsHost=1-Pfad griff der true-Default, deshalb fiel das vorher
+#    nie auf.
+#  * ServerRecordDemos: defaultValue(false), aber dedicatedValue(TRUE). Der
+#    Reaper raeumt nur Prozesse ab, nicht die Session-Verzeichnisse -- Demos
+#    wuerden sich auf dem kleinen VPS unbegrenzt sammeln. Fuer Desync-Analysen
+#    hier bewusst auf 1 stellen und danach wieder aus.
+#
+# StoreDefaultSettings ist der Grund, warum die Datei ueberhaupt wirkt, und darf
+# NICHT entfernt werden: ConfigHandlerImpl::FinalizeLoad ruft sonst
+# RemoveDefaults(), und das vergleicht die Datei gegen die NORMALE
+# DefaultConfigSource -- ohne zu wissen, dass die DedicatedConfigSource in der
+# Quellen-Kette zwischen Datei und Defaults sitzt. Beide Werte oben entsprechen
+# genau dem normalen Default, wuerden also als "ueberfluessig" aus der Datei
+# geloescht, worauf wieder der abweichende Dedicated-Wert greift. Netto: ein
+# Config-Key mit dedicatedValue != defaultValue laesst sich per Datei sonst
+# nicht auf seinen normalen Default setzen. StoreDefaultSettings=1 ueberspringt
+# RemoveDefaults und macht die Werte damit stabil.
+CONFIG_TEMPLATE = """StoreDefaultSettings = 1
+AllowSpectatorJoin = 1
+ServerRecordDemos = 0
+"""
+
 
 class RelaySession:
     def __init__(self, cell_id: str, port: int, proc: subprocess.Popen,
@@ -167,6 +199,11 @@ class RelayManager:
                 script_text.replace(PORT_MARKER, f"HostPort={port};", 1),
                 encoding="utf-8")
 
+            # Config MUSS explizit mit: das dedicated-Binary hat abweichende
+            # Defaults (ConfigVariable dedicatedValue), und zwei davon treffen uns.
+            config_path = session_dir / "springsettings.cfg"
+            config_path.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+
             log_path = session_dir / "dedicated.log"
             env = {
                 "HOME": str(session_dir),
@@ -177,7 +214,8 @@ class RelayManager:
             try:
                 with log_path.open("wb") as log_handle:
                     proc = subprocess.Popen(
-                        [str(self._binary()), str(script_path)],
+                        [str(self._binary()), "--config", str(config_path),
+                         str(script_path)],
                         cwd=session_dir, env=env,
                         stdout=log_handle, stderr=subprocess.STDOUT,
                         stdin=subprocess.DEVNULL)
