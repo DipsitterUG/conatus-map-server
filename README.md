@@ -15,6 +15,8 @@ rsync) leben im Studio-Repo (`conatus-studio`, Modul `map_server`).
 | `/maps/<datei>` | beide | statisches Archiv |
 | `/snapshots/<cell_id>` | Launcher/Uploader | `GET`/`PUT` eines Zell-Snapshots (`text/plain`, last-writer-wins) |
 | `/presence/<cell_id>` | Launcher/Uploader | `GET`/`PUT` aktuelle Host-IP/Port mit kurzer TTL |
+| `/arrivals/<cell_id>` | Launcher (Zellwechsel) | `PUT` haengt EINE Arrival-Zeile an (`text/plain`), Antwort enthaelt die vom Server vergebene `id`; `GET` liefert alle offenen Arrivals (`{cell_id, count, arrivals:[{id, line}]}`), aeltestes zuerst |
+| `/arrivals/<cell_id>/<id>` | Launcher (Zellwechsel) | `DELETE` quittiert genau diesen Eintrag nach erfolgtem Spawn — idempotent, unbekannte/schon quittierte `id` ist Erfolg |
 | `/logs` | Diagnose | `GET` Index: `{player: [{run_id, kinds}, ...]}`, neueste zuerst |
 | `/logs/<player>/<run_id>/<kind>` | Launcher/Diagnose | `GET`/`PUT` Log-Datei (`kind` = `launcher` \| `engine`), last-writer-wins pro Run, nur die letzten 3 Runs pro Spieler bleiben erhalten |
 | `/relay/health` | Launcher (Status-Indikator) | `GET` `{ok, dedicated_ready, active_sessions, ports_free}` |
@@ -49,6 +51,30 @@ PYTHONPATH=src python3 -m conatus_studio.cli sync-map-server \
 
 Der Server liest ausschliesslich das mitgespiegelte `maps.json`
 (Index-Datei-Modus) und uebernimmt Aenderungen ohne Neustart.
+
+### Arrivals (Zellwechsel)
+
+Ein Arrival ist eine Einheit, die von Zelle A nach Zelle B wechselt. Der Kanal
+ist bewusst **append-only und getrennt vom Snapshot**: laege das Arrival wie
+frueher in einer Sektion des Ganzdatei-Snapshots, wuerde der Launcher von A
+mit seiner veralteten Kopie von `conatus_cell_B.txt` den laufenden Fortschritt
+von B ueberschreiben (last-writer-wins).
+
+- Ablauf: A `PUT`tet die Zeile nach `/arrivals/B` → Server vergibt die `id`;
+  B holt beim Start per `GET /arrivals/B` alle offenen Eintraege und quittiert
+  jeden nach erfolgtem Spawn mit `DELETE /arrivals/B/<id>`. Zustellgarantie:
+  ohne Quittung bleibt der Eintrag liegen (auch ueber Serverneustarts).
+- Datei-Layout: `arrivals/<cell>/<id>.txt`, eine Datei pro Eintrag — dadurch
+  koennen zwei Nachbarzellen gleichzeitig in dieselbe Zelle schreiben, ohne
+  sich zu ueberschreiben.
+- `id`: Nanosekunden-Zeitstempel mit fester Breite, unter Lock strikt
+  hochgezaehlt → monoton, lexikografisch sortierbar, kollisionsfrei auch bei
+  zwei Uploads in derselben Sekunde.
+- Grenzen: `MAX_ARRIVAL_LINE_BYTES` = 4 KiB pro Zeile,
+  `MAX_ARRIVALS_PER_CELL` = 512 offene Eintraege pro Zelle. Ist der Deckel
+  erreicht, antwortet der Server `507` statt den aeltesten Eintrag zu
+  verwerfen (ein Arrival ist Spieler-Besitz; eine Absage ist reparierbar, ein
+  stiller Verlust nicht).
 
 ### Relay (internet-hosting)
 

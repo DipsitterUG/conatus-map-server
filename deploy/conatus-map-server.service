@@ -12,12 +12,13 @@ WorkingDirectory=/opt/conatus-map-server
 Environment=PYTHONPATH=/opt/conatus-map-server
 Environment=CONATUS_SNAPSHOTS_DIR=/srv/conatus-maps/snapshots
 Environment=CONATUS_LOGS_DIR=/srv/conatus-maps/logs
+Environment=CONATUS_ARRIVALS_DIR=/srv/conatus-maps/arrivals
 # Relay-Defaults (internet-hosting); Engine kommt via deploy/setup-relay.sh.
 # Fehlt das Engine-Verzeichnis, meldet /relay/health dedicated_ready=false.
 Environment=CONATUS_RELAY_ENGINE_DIR=/opt/conatus-relay/engine
 Environment=CONATUS_RELAY_RUN_DIR=/srv/conatus-maps/relay
 Environment=CONATUS_RELAY_PORTS=8452-8461
-# CONATUS_MAPS_DIR / CONATUS_SNAPSHOTS_DIR / CONATUS_LOGS_DIR / CONATUS_PORT / CONATUS_MAP_SECRET / CONATUS_BASE_URL:
+# CONATUS_MAPS_DIR / CONATUS_SNAPSHOTS_DIR / CONATUS_LOGS_DIR / CONATUS_ARRIVALS_DIR / CONATUS_PORT / CONATUS_MAP_SECRET / CONATUS_BASE_URL:
 EnvironmentFile=/etc/conatus-map-server.env
 ExecStart=/usr/bin/python3 -m map_server.server \
     --maps-dir ${CONATUS_MAPS_DIR} \
@@ -26,6 +27,7 @@ ExecStart=/usr/bin/python3 -m map_server.server \
     --base-url ${CONATUS_BASE_URL} \
     --snapshots-dir ${CONATUS_SNAPSHOTS_DIR} \
     --logs-dir ${CONATUS_LOGS_DIR} \
+    --arrivals-dir ${CONATUS_ARRIVALS_DIR} \
     --relay-engine-dir ${CONATUS_RELAY_ENGINE_DIR} \
     --relay-run-dir ${CONATUS_RELAY_RUN_DIR} \
     --relay-ports ${CONATUS_RELAY_PORTS}

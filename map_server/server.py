@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,6 +20,17 @@ PRESENCE_TTL_SECONDS = 90
 MAX_LOG_BYTES = 8 * 1024 * 1024
 LOG_RUNS_PER_PLAYER = 3
 LOG_KINDS = ("launcher", "engine")
+# Arrivals (Zellwechsel einer Einheit): eine Zeile pro Eintrag, deshalb klein.
+MAX_ARRIVAL_LINE_BYTES = 4 * 1024
+# Deckel pro Zelle. Entscheidung: bei Ueberschreitung 507 statt "aeltesten
+# verwerfen" -- ein Arrival ist Spieler-Besitz, und der Absender loescht seine
+# Einheit erst nach erfolgreichem PUT. Eine Absage ist damit reparierbar (der
+# Absender behaelt die Einheit und versucht es spaeter erneut), ein stilles
+# Verwerfen des aeltesten Eintrags waere dagegen ein echter Verlust.
+MAX_ARRIVALS_PER_CELL = 512
+# Feste Breite der id: time_ns() hat heute 19 Stellen, 20 Stellen halten die
+# lexikografische Sortierung == numerische Sortierung bis weit ins Jahr 2286.
+ARRIVAL_ID_DIGITS = 20
 
 
 def springfiles_result(entry: MapEntry, public_base: str) -> dict[str, object]:
@@ -68,6 +80,31 @@ def atomic_write(path: Path, data: bytes) -> None:
             pass
 
 
+def next_arrival_id(newest_existing: str | None, last_issued_ns: int) -> tuple[str, int]:
+    """Naechste Arrival-id: monoton steigend und lexikografisch sortierbar.
+
+    Strategie: Nanosekunden-Zeitstempel (time.time_ns) mit fester Breite
+    ARRIVAL_ID_DIGITS, dadurch sortiert die Log-Retention-Regel (rein
+    lexikografisch, siehe _prune_old_runs) auch hier korrekt. Zwei PUTs in
+    derselben Sekunde koennen nicht kollidieren, weil die Aufloesung
+    Nanosekunden ist UND der Wert unter dem arrivals_lock zusaetzlich immer
+    strikt hochgezaehlt wird: gegen den letzten selbst vergebenen Wert
+    (gleiche Nanosekunde bei zwei Threads) und gegen die neueste id, die schon
+    auf Platte liegt (Serverneustart oder zurueckgestellte Uhr).
+    """
+    candidate = time.time_ns()
+    if last_issued_ns >= candidate:
+        candidate = last_issued_ns + 1
+    if newest_existing:
+        try:
+            on_disk = int(newest_existing)
+        except ValueError:
+            on_disk = 0
+        if on_disk >= candidate:
+            candidate = on_disk + 1
+    return f"{candidate:0{ARRIVAL_ID_DIGITS}d}", candidate
+
+
 class MapServerHandler(BaseHTTPRequestHandler):
     # ThreadingHTTPServer-Attribute, von create_server gesetzt:
     #   self.server.map_index: MapIndex
@@ -76,6 +113,8 @@ class MapServerHandler(BaseHTTPRequestHandler):
     #   self.server.snapshots_dir: Path
     #   self.server.presence_dir: Path
     #   self.server.logs_dir: Path
+    #   self.server.arrivals_dir: Path
+    #   self.server.arrivals_lock: threading.Lock
 
     protocol_version = "HTTP/1.1"
 
@@ -123,6 +162,9 @@ class MapServerHandler(BaseHTTPRequestHandler):
             return
         if path.startswith("/presence/"):
             self._route_presence(unquote(path[len("/presence/"):]))
+            return
+        if path.startswith("/arrivals/"):
+            self._route_arrivals(unquote(path[len("/arrivals/"):]))
             return
         if path == "/relay/health":
             if self.command != "GET":
@@ -324,6 +366,129 @@ class MapServerHandler(BaseHTTPRequestHandler):
         stored["ttl_seconds"] = PRESENCE_TTL_SECONDS
         self._send_json(200, stored)
 
+    # Arrivals (Zellwechsel): eigener append-only Kanal, bewusst GETRENNT vom
+    # Snapshot. Der Snapshot ist last-writer-wins -- laege ein Arrival darin,
+    # wuerde die absendende Zelle mit ihrer veralteten Kopie den laufenden
+    # Fortschritt der Nachbarzelle ueberschreiben. Zustellgarantie: ein Arrival
+    # bleibt liegen, bis der Empfaenger es nach erfolgreichem Spawn per DELETE
+    # quittiert.
+    #
+    # Datei-Layout: arrivals_dir/<cell>/<id>.txt, eine Datei pro Eintrag mit
+    # der rohen Zeile. Eine Datei pro Eintrag statt einer gemeinsamen Datei,
+    # weil dadurch zwei Zellen gleichzeitig in dieselbe Nachbarzelle schreiben
+    # koennen, ohne sich zu ueberschreiben (kein read-modify-write), eine
+    # Quittung genau einen Eintrag entfernt und alles einen Serverneustart
+    # ueberlebt (kein Zustand im Prozess ausser der id-Vergabe).
+    # Anders als bei Snapshots/Logs ist die Zelle hier ein VERZEICHNIS-Name.
+    # Die Whitelist erlaubt Punkte (Karten-Namen wie "nature.0.2"), deshalb
+    # muessen "." und ".." zusaetzlich raus -- sonst zeigte der Pfad aus
+    # arrivals_dir heraus (bei Snapshots faengt das angehaengte ".txt" das ab).
+    def _arrivals_cell_dir(self, cell_id: str) -> Path | None:
+        safe = safe_cell_id(cell_id)
+        if safe is None or safe.startswith("."):
+            return None
+        return self.server.arrivals_dir / safe
+
+    def _arrival_id_segment(self, arrival_id: str) -> str | None:
+        safe = safe_log_segment(arrival_id)
+        if safe is None or safe.startswith("."):
+            return None
+        return safe
+
+    def _list_arrival_ids(self, cell_dir: Path) -> list[str]:
+        if not cell_dir.is_dir():
+            return []
+        # Lexikografisch sortiert = aeltestes zuerst (feste id-Breite).
+        return sorted(entry.stem for entry in cell_dir.glob("*.txt") if entry.is_file())
+
+    def _route_arrivals(self, rest: str) -> None:
+        parts = rest.split("/")
+        if len(parts) == 1:
+            cell_dir = self._arrivals_cell_dir(parts[0])
+            if cell_dir is None:
+                self._send_json(400, {"error": "invalid cell id"})
+                return
+            if self.command == "GET":
+                self._serve_arrivals(parts[0], cell_dir)
+                return
+            if self.command == "PUT":
+                self._put_arrival(parts[0], cell_dir)
+                return
+            self._send_json(405, {"error": "method not allowed"})
+            return
+        if len(parts) == 2:
+            cell_dir = self._arrivals_cell_dir(parts[0])
+            arrival_id = self._arrival_id_segment(parts[1])
+            if cell_dir is None or arrival_id is None:
+                self._send_json(400, {"error": "invalid cell id or arrival id"})
+                return
+            if self.command == "DELETE":
+                self._delete_arrival(parts[0], cell_dir, arrival_id)
+                return
+            self._send_json(405, {"error": "method not allowed"})
+            return
+        self._send_json(400, {"error": "expected /arrivals/<cell> or /arrivals/<cell>/<id>"})
+
+    def _serve_arrivals(self, cell_id: str, cell_dir: Path) -> None:
+        arrivals: list[dict[str, object]] = []
+        for arrival_id in self._list_arrival_ids(cell_dir):
+            try:
+                line = (cell_dir / f"{arrival_id}.txt").read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            arrivals.append({"id": arrival_id, "line": line.strip("\n")})
+        self._send_json(200, {"cell_id": cell_id, "count": len(arrivals), "arrivals": arrivals})
+
+    def _put_arrival(self, cell_id: str, cell_dir: Path) -> None:
+        body = self._read_body(MAX_ARRIVAL_LINE_BYTES)
+        try:
+            line = body.decode("utf-8")
+        except UnicodeDecodeError:
+            self._send_json(400, {"error": "arrival must be UTF-8", "cell_id": cell_id})
+            return
+        line = line.strip("\r\n")
+        if not line.strip():
+            self._send_json(400, {"error": "empty arrival", "cell_id": cell_id})
+            return
+        if "\n" in line or "\r" in line:
+            self._send_json(400, {"error": "arrival must be a single line", "cell_id": cell_id})
+            return
+        # Der Lock schuetzt nur id-Vergabe + Deckel-Pruefung; das Schreiben
+        # selbst trifft eine eigene Datei und braucht keine Serialisierung.
+        with self.server.arrivals_lock:
+            existing = self._list_arrival_ids(cell_dir)
+            if len(existing) >= MAX_ARRIVALS_PER_CELL:
+                self._send_json(507, {
+                    "error": "arrival queue full",
+                    "cell_id": cell_id,
+                    "count": len(existing),
+                    "limit": MAX_ARRIVALS_PER_CELL,
+                })
+                return
+            arrival_id, issued_ns = next_arrival_id(
+                existing[-1] if existing else None,
+                self.server.arrivals_last_ns,
+            )
+            self.server.arrivals_last_ns = issued_ns
+            # mkdir passiert in atomic_write (parents/exist_ok): ein nach einem
+            # Deploy fehlendes arrivals_dir darf den Server nicht lahmlegen.
+            atomic_write(cell_dir / f"{arrival_id}.txt", (line + "\n").encode("utf-8"))
+        self._send_json(200, {
+            "ok": True,
+            "cell_id": cell_id,
+            "id": arrival_id,
+            "size": len(body),
+        })
+
+    def _delete_arrival(self, cell_id: str, cell_dir: Path, arrival_id: str) -> None:
+        # Idempotent: eine verlorene Quittung (Netzabbruch nach dem Spawn) darf
+        # beim Wiederholen nicht als Fehler zurueckkommen.
+        try:
+            (cell_dir / f"{arrival_id}.txt").unlink()
+        except FileNotFoundError:
+            pass
+        self._send_json(200, {"ok": True, "cell_id": cell_id, "id": arrival_id})
+
     # Relay-Sessions (Baustein internet-hosting): der Launcher des initiierenden
     # Spielers PUTtet das komplette Startscript; der Manager startet einen
     # spring-dedicated-Prozess und antwortet mit dem UDP-Port. Beide Spieler
@@ -452,6 +617,7 @@ def create_server(
     snapshots_dir: Path | None = None,
     presence_dir: Path | None = None,
     logs_dir: Path | None = None,
+    arrivals_dir: Path | None = None,
     relay_engine_dir: Path | None = None,
     relay_run_dir: Path | None = None,
     relay_ports: str = DEFAULT_PORT_RANGE,
@@ -463,6 +629,12 @@ def create_server(
     server.snapshots_dir = snapshots_dir or (maps_dir.parent / "snapshots")
     server.presence_dir = presence_dir or (maps_dir.parent / "presence")
     server.logs_dir = logs_dir or (maps_dir.parent / "logs")
+    server.arrivals_dir = arrivals_dir or (maps_dir.parent / "arrivals")
+    # ThreadingHTTPServer bearbeitet jede Anfrage in einem eigenen Thread
+    # (siehe RelayManager.lock als Vorbild): der Lock serialisiert nur die
+    # id-Vergabe der Arrivals, nicht das Schreiben.
+    server.arrivals_lock = threading.Lock()
+    server.arrivals_last_ns = 0
     server.relay_manager = RelayManager(
         engine_dir=relay_engine_dir,
         run_dir=relay_run_dir or (maps_dir.parent / "relay"),
@@ -475,6 +647,7 @@ def serve_maps(
     snapshots_dir: Path | None = None,
     presence_dir: Path | None = None,
     logs_dir: Path | None = None,
+    arrivals_dir: Path | None = None,
     host: str = "0.0.0.0",
     port: int = DEFAULT_PORT,
     base_url: str | None = None,
@@ -487,10 +660,12 @@ def serve_maps(
     resolved_snapshots = snapshots_dir or (maps_dir.parent / "snapshots")
     resolved_presence = presence_dir or (maps_dir.parent / "presence")
     resolved_logs = logs_dir or (maps_dir.parent / "logs")
+    resolved_arrivals = arrivals_dir or (maps_dir.parent / "arrivals")
     resolved_relay_run = relay_run_dir or (maps_dir.parent / "relay")
     resolved_snapshots.mkdir(parents=True, exist_ok=True)
     resolved_presence.mkdir(parents=True, exist_ok=True)
     resolved_logs.mkdir(parents=True, exist_ok=True)
+    resolved_arrivals.mkdir(parents=True, exist_ok=True)
     resolved_relay_run.mkdir(parents=True, exist_ok=True)
     server = create_server(
         maps_dir,
@@ -501,6 +676,7 @@ def serve_maps(
         snapshots_dir=resolved_snapshots,
         presence_dir=resolved_presence,
         logs_dir=resolved_logs,
+        arrivals_dir=resolved_arrivals,
         relay_engine_dir=relay_engine_dir,
         relay_run_dir=resolved_relay_run,
         relay_ports=relay_ports,
@@ -515,7 +691,8 @@ def serve_maps(
     prefix = ("/" + server.secret) if server.secret else ""
     print(f"[map-server] lauscht auf http://{host}:{port}{prefix} "
           f"(maps.json | json.php?category=map&springname=... | maps/<datei> | "
-          f"snapshots/<cell> | presence/<cell> | logs | logs/<player>/<run>/<kind> | "
+          f"snapshots/<cell> | presence/<cell> | arrivals/<cell>[/<id>] | "
+          f"logs | logs/<player>/<run>/<kind> | "
           f"relay/health | relay/sessions[/<cell>])", flush=True)
     relay_state = ("bereit, engine=" + str(relay_engine_dir)
                    if server.relay_manager.dedicated_ready()
@@ -539,6 +716,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Verzeichnis fuer kurzlebige Host-Presence (Default: ../presence)")
     parser.add_argument("--logs-dir", type=Path, default=None,
                         help="Verzeichnis fuer Diagnose-Logs pro Spieler (Default: ../logs)")
+    parser.add_argument("--arrivals-dir", type=Path, default=None,
+                        help="Verzeichnis fuer offene Zell-Arrivals (Default: ../arrivals)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--base-url", default=None,
@@ -554,7 +733,8 @@ def main(argv: list[str] | None = None) -> int:
                         help=f"UDP-Portbereich fuer Relay-Sessions (Default: {DEFAULT_PORT_RANGE})")
     args = parser.parse_args(argv)
     serve_maps(args.maps_dir, snapshots_dir=args.snapshots_dir, presence_dir=args.presence_dir,
-               logs_dir=args.logs_dir, host=args.host, port=args.port,
+               logs_dir=args.logs_dir, arrivals_dir=args.arrivals_dir,
+               host=args.host, port=args.port,
                base_url=args.base_url, secret=args.secret,
                relay_engine_dir=args.relay_engine_dir, relay_run_dir=args.relay_run_dir,
                relay_ports=args.relay_ports)

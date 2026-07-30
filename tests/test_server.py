@@ -4,13 +4,20 @@ import hashlib
 import json
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 from map_server.index import MapIndex
-from map_server.server import create_server
+from map_server.server import (
+    ARRIVAL_ID_DIGITS,
+    MAX_ARRIVAL_LINE_BYTES,
+    MAX_ARRIVALS_PER_CELL,
+    create_server,
+    next_arrival_id,
+)
 
 
 def _write_fixture(maps_dir: Path) -> None:
@@ -66,11 +73,14 @@ class ServerTestBase(unittest.TestCase):
             # zielt in der Produktion auf ein Geschwisterverzeichnis von "maps/", trifft
             # hier aber das geteilte /tmp, weil maps_dir selbst schon das Tempdir ist.
             logs_dir=maps_dir / "logs",
+            arrivals_dir=maps_dir / "arrivals",
             relay_run_dir=maps_dir / "relay",
         )
+        self.maps_dir = maps_dir
         self.snapshots_dir = self.server.snapshots_dir
         self.presence_dir = self.server.presence_dir
         self.logs_dir = self.server.logs_dir
+        self.arrivals_dir = self.server.arrivals_dir
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -96,6 +106,19 @@ class ServerTestBase(unittest.TestCase):
             data=data,
             method="PUT",
             headers={"Content-Type": content_type},
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            error.close()
+            return error.code, body
+
+    def _delete(self, path: str) -> tuple[int, bytes]:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            method="DELETE",
         )
         try:
             with urllib.request.urlopen(request) as response:
@@ -211,6 +234,137 @@ class PlainServerTest(ServerTestBase):
             remaining,
             ["20260725-100100", "20260725-100200", "20260725-100300"],
         )
+
+    def test_arrival_put_get_roundtrip(self) -> None:
+        line = b"unit=conatus_worker;health=100;from=map_0_0"
+        status, body = self._put("/arrivals/map_0_1", line)
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["cell_id"], "map_0_1")
+        self.assertEqual(len(payload["id"]), ARRIVAL_ID_DIGITS)
+        self.assertTrue((self.arrivals_dir / "map_0_1" / f"{payload['id']}.txt").is_file())
+
+        status, body = self._get("/arrivals/map_0_1")
+        self.assertEqual(status, 200)
+        listing = json.loads(body)
+        self.assertEqual(listing["cell_id"], "map_0_1")
+        self.assertEqual(listing["count"], 1)
+        self.assertEqual(listing["arrivals"], [{"id": payload["id"], "line": line.decode()}])
+        # Unbekannte Zelle ist leer, kein 404: der Empfaenger fragt bei jedem Start.
+        self.assertEqual(json.loads(self._get("/arrivals/map_9_9")[1])["arrivals"], [])
+
+    def test_arrival_get_returns_oldest_first(self) -> None:
+        ids = []
+        for index in range(4):
+            status, body = self._put("/arrivals/map_0_1", f"unit=nr{index}".encode())
+            self.assertEqual(status, 200, body)
+            ids.append(json.loads(body)["id"])
+        listing = json.loads(self._get("/arrivals/map_0_1")[1])
+        self.assertEqual([entry["id"] for entry in listing["arrivals"]], ids)
+        self.assertEqual(
+            [entry["line"] for entry in listing["arrivals"]],
+            ["unit=nr0", "unit=nr1", "unit=nr2", "unit=nr3"],
+        )
+        self.assertEqual(ids, sorted(ids))
+
+    def test_arrival_delete_acks_only_that_entry(self) -> None:
+        first = json.loads(self._put("/arrivals/map_0_1", b"unit=a")[1])["id"]
+        second = json.loads(self._put("/arrivals/map_0_1", b"unit=b")[1])["id"]
+        status, body = self._delete(f"/arrivals/map_0_1/{first}")
+        self.assertEqual(status, 200, body)
+        self.assertTrue(json.loads(body)["ok"])
+        listing = json.loads(self._get("/arrivals/map_0_1")[1])
+        self.assertEqual([entry["id"] for entry in listing["arrivals"]], [second])
+
+    def test_arrival_delete_is_idempotent(self) -> None:
+        arrival_id = json.loads(self._put("/arrivals/map_0_1", b"unit=a")[1])["id"]
+        self.assertEqual(self._delete(f"/arrivals/map_0_1/{arrival_id}")[0], 200)
+        # Verlorene Quittung: das Wiederholen darf kein Fehler sein.
+        self.assertEqual(self._delete(f"/arrivals/map_0_1/{arrival_id}")[0], 200)
+        # Nie existierende id genauso.
+        self.assertEqual(self._delete("/arrivals/map_0_1/00000000000000000001")[0], 200)
+        self.assertEqual(json.loads(self._get("/arrivals/map_0_1")[1])["count"], 0)
+
+    def test_arrival_rejects_bad_segments_and_oversized_body(self) -> None:
+        self.assertEqual(self._put("/arrivals/bad%20cell", b"unit=a")[0], 400)
+        self.assertEqual(self._put("/arrivals/%2E%2E", b"unit=a")[0], 400)
+        # Zelle ist ein Verzeichnisname -> Traversal muss abgewiesen werden.
+        self.assertEqual(self._delete("/arrivals/..%2Fbad")[0], 400)
+        self.assertEqual(self._delete("/arrivals/map_0_1/%2E%2E")[0], 400)
+        self.assertEqual(self._delete("/arrivals/map_0_1/bad%20id")[0], 400)
+        self.assertEqual(self._delete("/arrivals/map_0_1/id/zuviel")[0], 400)
+        self.assertEqual(self._put("/arrivals/map_0_1", b"")[0], 400)
+        self.assertEqual(self._put("/arrivals/map_0_1", b"unit=a\nunit=b")[0], 400)
+        self.assertEqual(
+            self._put("/arrivals/map_0_1", b"x" * (MAX_ARRIVAL_LINE_BYTES + 1))[0],
+            400,
+        )
+        self.assertEqual(json.loads(self._get("/arrivals/map_0_1")[1])["count"], 0)
+
+    def test_arrival_ids_differ_within_same_second(self) -> None:
+        ids = [json.loads(self._put("/arrivals/map_0_1", b"unit=a")[1])["id"] for _ in range(8)]
+        self.assertEqual(len(set(ids)), len(ids))
+        self.assertEqual(json.loads(self._get("/arrivals/map_0_1")[1])["count"], len(ids))
+
+    def test_arrival_cap_answers_507_and_keeps_queue(self) -> None:
+        # Deckel direkt auf der Platte herstellen (MAX_ARRIVALS_PER_CELL echte
+        # PUTs waeren nur langsam, nicht aussagekraeftiger).
+        cell_dir = self.arrivals_dir / "map_0_1"
+        cell_dir.mkdir(parents=True, exist_ok=True)
+        for index in range(MAX_ARRIVALS_PER_CELL):
+            (cell_dir / f"{index:020d}.txt").write_text(f"unit=nr{index}\n", encoding="utf-8")
+        status, body = self._put("/arrivals/map_0_1", b"unit=zuviel")
+        self.assertEqual(status, 507, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["limit"], MAX_ARRIVALS_PER_CELL)
+        # Nichts verworfen: der Absender behaelt seine Einheit und darf spaeter erneut.
+        self.assertEqual(len(list(cell_dir.glob("*.txt"))), MAX_ARRIVALS_PER_CELL)
+        self.assertEqual(
+            json.loads(self._get("/arrivals/map_0_1")[1])["count"],
+            MAX_ARRIVALS_PER_CELL,
+        )
+
+    def test_arrivals_survive_a_new_server_instance(self) -> None:
+        arrival_id = json.loads(self._put("/arrivals/map_0_1", b"unit=bleibt")[1])["id"]
+        # Neustart-Simulation: zweite Instanz auf demselben arrivals_dir.
+        other = create_server(
+            self.maps_dir, host="127.0.0.1", port=0,
+            logs_dir=self.maps_dir / "logs",
+            arrivals_dir=self.arrivals_dir,
+            relay_run_dir=self.maps_dir / "relay",
+        )
+        thread = threading.Thread(target=other.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = other.server_address[1]
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/arrivals/map_0_1") as response:
+                listing = json.loads(response.read())
+        finally:
+            other.shutdown()
+            other.server_close()
+            thread.join(timeout=5)
+        self.assertEqual([entry["id"] for entry in listing["arrivals"]], [arrival_id])
+        self.assertEqual(listing["arrivals"][0]["line"], "unit=bleibt")
+
+
+class ArrivalIdTest(unittest.TestCase):
+    def test_same_nanosecond_cannot_collide(self) -> None:
+        first, first_ns = next_arrival_id(None, 0)
+        # last_issued_ns == die Nanosekunde, in der auch der zweite PUT liegt.
+        second, second_ns = next_arrival_id(None, first_ns)
+        self.assertNotEqual(first, second)
+        self.assertGreater(second_ns, first_ns)
+        # Fest breit -> lexikografische Sortierung == zeitliche Reihenfolge.
+        self.assertEqual(len(first), len(second))
+        self.assertLess(first, second)
+
+    def test_bumps_past_newest_id_on_disk(self) -> None:
+        # Zurueckgestellte Uhr / Neustart: die id muss trotzdem steigen.
+        newest = f"{time.time_ns() + 10 ** 12:0{ARRIVAL_ID_DIGITS}d}"
+        later, _ = next_arrival_id(newest, 0)
+        self.assertGreater(later, newest)
+        self.assertEqual(len(later), ARRIVAL_ID_DIGITS)
 
 
 class SecretAndBaseUrlTest(ServerTestBase):
