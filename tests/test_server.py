@@ -467,10 +467,25 @@ class PresenceRelayTruthTest(ServerTestBase):
         self.assertEqual(payload["host_port"], 8461)
 
     def test_running_session_without_any_presence_file(self) -> None:
+        # Der Initiator hat sich abgemeldet (Presence geloescht), ein Gast spielt
+        # weiter. Der Client braucht hier BEIDES: ohne host_ip haelt er die Zelle
+        # fuer frei, betritt sie als Host und rechnet ihr Offline-Zeit an --
+        # obwohl sie gerade laeuft. Die Session laeuft auf DIESEM Server, also
+        # kann er die Adresse selbst beantworten.
         self.server.relay_manager = _FakeRelayManager(ready=True, sessions={"map_9_9": 8462})
         payload = json.loads(self._get("/presence/map_9_9")[1])
         self.assertTrue(payload["hosted"], payload)
         self.assertEqual(payload["host_port"], 8462)
+        self.assertTrue(payload.get("host_ip"), payload)
+
+    def test_running_session_keeps_known_host_ip(self) -> None:
+        # Steht schon eine Adresse in der Presence, bleibt sie stehen -- hinter
+        # einem Proxy/einer Domain ist sie genauer als der Host-Header.
+        self.server.relay_manager = _FakeRelayManager(ready=True, sessions={"map_0_0": 8463})
+        self._put_presence()
+        payload = json.loads(self._get("/presence/map_0_0")[1])
+        self.assertEqual(payload["host_ip"], "10.0.0.2")
+        self.assertEqual(payload["host_port"], 8463)
 
     def test_without_relay_capability_heartbeat_still_decides(self) -> None:
         # Dev/LAN ohne dedicated-Binary: alles laeuft wie vorher ueber die TTL.

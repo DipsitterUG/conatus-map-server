@@ -340,6 +340,16 @@ class MapServerHandler(BaseHTTPRequestHandler):
     #      jedes Hosting, also gibt es ohne Session auch nichts zu betreten.
     #   3. ohne Relay-Faehigkeit (Dev/LAN) bleibt der Heartbeat mit seiner TTL
     #      die einzige Quelle -- unveraendertes Verhalten.
+    # Host-Anteil dieses Servers -- die Relay-Sessions laufen im selben Prozess,
+    # also ist das auch ihre Adresse. --base-url gewinnt (Betrieb hinter
+    # Domain/Proxy/TLS), sonst der Host-Header der Anfrage.
+    def _relay_host(self) -> str:
+        base = self.server.base_url
+        if base:
+            return urlsplit(base).hostname or ""
+        host = self.headers.get("Host") or self.server.server_name
+        return host.rsplit(":", 1)[0] if ":" in host else host
+
     def _serve_presence(self, cell_id: str, path: Path) -> None:
         payload: dict[str, object] = {}
         if path.is_file():
@@ -354,6 +364,15 @@ class MapServerHandler(BaseHTTPRequestHandler):
             payload["cell_id"] = cell_id
             payload["hosted"] = True
             payload["host_port"] = session.port
+            # Die Session laeuft auf DIESEM Server, also kann er die Adresse
+            # selbst beantworten. Noetig, wenn der Initiator sich abgemeldet hat
+            # (Presence geloescht) und ein Gast weiterspielt: ohne host_ip haelt
+            # der Client die Zelle fuer frei, betritt sie als Host und rechnet
+            # ihr Offline-Zeit an, obwohl sie gerade laeuft. Eine bereits
+            # bekannte Adresse bleibt stehen -- hinter Proxy/Domain ist sie
+            # genauer als der Host-Header.
+            if not str(payload.get("host_ip") or "").strip():
+                payload["host_ip"] = self._relay_host()
             payload["ttl_seconds"] = PRESENCE_TTL_SECONDS
             payload["source"] = "relay session"
             self._send_json(200, payload)
