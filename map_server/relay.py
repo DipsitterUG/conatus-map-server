@@ -168,6 +168,22 @@ class RelayManager:
             self._reap_locked()
             return {"sessions": [s.to_dict() for s in self.sessions.values()]}
 
+    def session_for(self, cell_id: str) -> RelaySession | None:
+        """Laufende Session dieser Zelle (oder None).
+
+        Das ist die einzige verlaessliche Antwort auf "wird diese Zelle gerade
+        gespielt": die Engine beendet den dedicated SOFORT, sobald der letzte
+        Client weg ist ("No clients connected, shutting down server", gemessen
+        2026-07-31). Die Presence-Datei dagegen lebt noch bis zu ihrer TTL
+        weiter und schickt Beitretende in diesem Fenster auf eine tote Adresse.
+        """
+        with self.lock:
+            self._reap_locked()
+            session = self.sessions.get(cell_id)
+            if session is None or not session.is_running():
+                return None
+            return session
+
     def start(self, cell_id: str, script_text: str) -> tuple[int, dict[str, object]]:
         """Startet einen dedicated fuer die Zelle (oder meldet den laufenden).
 

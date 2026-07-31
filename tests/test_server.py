@@ -9,6 +9,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 from map_server.index import MapIndex
 from map_server.server import (
@@ -388,6 +389,102 @@ class SecretAndBaseUrlTest(ServerTestBase):
             result["mirrors"][0],
             "http://maps.example.org:8605/geheim123/maps/cell-a1.sd7",
         )
+
+
+class _FakeRelayManager:
+    """Minimaler RelayManager-Ersatz: sagt nur, ob er Sessions fahren kann und
+    welche gerade laufen. Mehr braucht die Presence-Wahrheit nicht."""
+
+    def __init__(self, ready: bool, sessions: dict[str, int] | None = None) -> None:
+        self._ready = ready
+        self._sessions = sessions or {}
+
+    def dedicated_ready(self) -> bool:
+        return self._ready
+
+    def session_for(self, cell_id: str):
+        port = self._sessions.get(cell_id)
+        if port is None:
+            return None
+        return SimpleNamespace(cell_id=cell_id, port=port, session_dir=None)
+
+
+class PresenceRelayTruthTest(ServerTestBase):
+    """Presence darf nicht behaupten, eine Zelle sei gehostet, wenn die Session
+    dafuer gar nicht mehr laeuft.
+
+    Gemessener Engine-Fakt (2026-07-31): der spring-dedicated beendet sich
+    SOFORT, sobald der letzte Client weg ist ("No clients connected, shutting
+    down server"). Die Presence-Datei lebt danach aber noch bis zu
+    PRESENCE_TTL_SECONDS weiter -- und wer in diesem Fenster die Zelle betritt,
+    wird auf eine tote Adresse geschickt. Genau das ist Symptom 3 aus der
+    2-PC-Abnahme ("obwohl kein Spieler hostet, moechte der sich verbinden").
+
+    Regel: laeuft eine Relay-Session, IST die Zelle gehostet (und der Port der
+    Session ist die Wahrheit). Kann der Server Relay-Sessions fahren und es
+    laeuft keine, ist sie NICHT gehostet -- egal wie frisch der Heartbeat ist.
+    Ohne Relay-Faehigkeit (Dev/LAN) bleibt der Heartbeat mit seiner TTL die
+    einzige Quelle.
+    """
+
+    def _put_presence(self, cell: str = "map_0_0", port: int = 8452) -> None:
+        status, body = self._put(
+            f"/presence/{cell}",
+            json.dumps({"host_ip": "10.0.0.2", "host_port": port, "player_name": "PC1"}).encode(),
+            "application/json",
+        )
+        self.assertEqual(status, 200, body)
+
+    def test_fresh_presence_without_relay_session_is_not_hosted(self) -> None:
+        self.server.relay_manager = _FakeRelayManager(ready=True, sessions={})
+        self._put_presence()
+        payload = json.loads(self._get("/presence/map_0_0")[1])
+        self.assertFalse(payload["hosted"], payload)
+        self.assertEqual(payload.get("reason"), "no relay session")
+
+    def test_running_relay_session_is_hosted_with_session_port(self) -> None:
+        self.server.relay_manager = _FakeRelayManager(ready=True, sessions={"map_0_0": 8460})
+        self._put_presence(port=8452)
+        payload = json.loads(self._get("/presence/map_0_0")[1])
+        self.assertTrue(payload["hosted"], payload)
+        # Der Port der laufenden Session gewinnt gegen den gespeicherten.
+        self.assertEqual(payload["host_port"], 8460)
+        self.assertEqual(payload["host_ip"], "10.0.0.2")
+        self.assertEqual(payload["player_name"], "PC1")
+
+    def test_running_session_outlives_expired_heartbeat(self) -> None:
+        # Host geht, Gast spielt weiter: der Heartbeat verfaellt, die Session
+        # laeuft. Die Zelle ist gehostet -- sonst betraete der naechste Spieler
+        # sie als "Host" und wuerde ihr Offline-Zeit anrechnen, obwohl sie laeuft.
+        self.server.relay_manager = _FakeRelayManager(ready=True, sessions={"map_0_0": 8461})
+        self._put_presence()
+        saved = self.presence_dir / "map_0_0.json"
+        stale = json.loads(saved.read_text(encoding="utf-8"))
+        stale["updated_at"] = 1
+        saved.write_text(json.dumps(stale), encoding="utf-8")
+        payload = json.loads(self._get("/presence/map_0_0")[1])
+        self.assertTrue(payload["hosted"], payload)
+        self.assertEqual(payload["host_port"], 8461)
+
+    def test_running_session_without_any_presence_file(self) -> None:
+        self.server.relay_manager = _FakeRelayManager(ready=True, sessions={"map_9_9": 8462})
+        payload = json.loads(self._get("/presence/map_9_9")[1])
+        self.assertTrue(payload["hosted"], payload)
+        self.assertEqual(payload["host_port"], 8462)
+
+    def test_without_relay_capability_heartbeat_still_decides(self) -> None:
+        # Dev/LAN ohne dedicated-Binary: alles laeuft wie vorher ueber die TTL.
+        self.server.relay_manager = _FakeRelayManager(ready=False, sessions={})
+        self._put_presence()
+        payload = json.loads(self._get("/presence/map_0_0")[1])
+        self.assertTrue(payload["hosted"], payload)
+        self.assertEqual(payload["host_port"], 8452)
+
+        saved = self.presence_dir / "map_0_0.json"
+        stale = json.loads(saved.read_text(encoding="utf-8"))
+        stale["updated_at"] = 1
+        saved.write_text(json.dumps(stale), encoding="utf-8")
+        self.assertFalse(json.loads(self._get("/presence/map_0_0")[1])["hosted"])
 
 
 if __name__ == "__main__":

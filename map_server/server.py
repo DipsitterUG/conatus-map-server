@@ -323,17 +323,52 @@ class MapServerHandler(BaseHTTPRequestHandler):
             return
         self._send_json(405, {"error": "method not allowed"})
 
+    # "Wird diese Zelle gerade gespielt?" ist eine Frage ueber die SESSION, nicht
+    # ueber den letzten Heartbeat. Der Heartbeat kommt von einem Spielclient und
+    # ueberlebt ihn um bis zu PRESENCE_TTL_SECONDS -- wer in diesem Fenster die
+    # Zelle betritt, wird auf eine tote Adresse geschickt (Symptom 3 der
+    # 2-PC-Abnahme 2026-07-30). Der Server weiss es besser: die Engine beendet
+    # den dedicated sofort, sobald der letzte Client weg ist ("No clients
+    # connected, shutting down server", gemessen 2026-07-31).
+    #
+    # Deshalb in dieser Reihenfolge:
+    #   1. laeuft eine Relay-Session -> gehostet, und IHR Port ist die Wahrheit
+    #      (auch wenn der Heartbeat laengst abgelaufen ist -- der Host kann
+    #      gegangen sein, waehrend ein Gast weiterspielt).
+    #   2. kann dieser Server Relay-Sessions fahren und laeuft keine -> NICHT
+    #      gehostet, egal wie frisch der Heartbeat ist. Ueber den Relay laeuft
+    #      jedes Hosting, also gibt es ohne Session auch nichts zu betreten.
+    #   3. ohne Relay-Faehigkeit (Dev/LAN) bleibt der Heartbeat mit seiner TTL
+    #      die einzige Quelle -- unveraendertes Verhalten.
     def _serve_presence(self, cell_id: str, path: Path) -> None:
-        if not path.is_file():
-            self._send_json(200, {"cell_id": cell_id, "hosted": False})
+        payload: dict[str, object] = {}
+        if path.is_file():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+
+        manager = self.server.relay_manager
+        session = manager.session_for(cell_id)
+        if session is not None:
+            payload["cell_id"] = cell_id
+            payload["hosted"] = True
+            payload["host_port"] = session.port
+            payload["ttl_seconds"] = PRESENCE_TTL_SECONDS
+            payload["source"] = "relay session"
+            self._send_json(200, payload)
             return
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            self._send_json(200, {"cell_id": cell_id, "hosted": False})
+
+        if manager.dedicated_ready():
+            self._send_json(200, {
+                "cell_id": cell_id,
+                "hosted": False,
+                "reason": "no relay session",
+            })
             return
+
         updated_at = int(payload.get("updated_at") or 0)
-        if int(time.time()) - updated_at > PRESENCE_TTL_SECONDS:
+        if not payload or int(time.time()) - updated_at > PRESENCE_TTL_SECONDS:
             self._send_json(200, {"cell_id": cell_id, "hosted": False})
             return
         payload["cell_id"] = cell_id
