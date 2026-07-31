@@ -13,7 +13,13 @@ Verifizierte Engine-Fakten (2026-07-25, lokaler WSL2-Test):
   verlangt die Engine die Archive.
 - SPRING_DATADIR muss das Engine-Verzeichnis (mit base/) enthalten;
   SPRING_WRITEDIR/HOME zeigen auf das Session-Verzeichnis.
-- Auto-Exit bei "keine Clients" ist NICHT zuverlaessig -> Reaper noetig.
+- Auto-Exit bei "keine Clients" funktioniert doch, und zwar SOFORT: der Server
+  meldet "No clients connected, shutting down server" und ist ~2 s spaeter weg
+  (gemessen 2026-07-31 im authority-vacancy-Smoke; die aeltere Notiz hier
+  behauptete das Gegenteil). Der Reaper bleibt trotzdem noetig -- fuer
+  Prozesse, die beim Start haengen bleiben, und als max_age-Deckel. Wichtiger:
+  daraus folgt "Session laeuft" == "Zelle wird gerade gespielt", worauf sich
+  die Presence-Wahrheit in server.py stuetzt.
 """
 
 from __future__ import annotations
