@@ -60,10 +60,31 @@ def safe_cell_id(value: str) -> str | None:
     return None
 
 
+# Wer ein Segment als PFAD-BESTANDTEIL verwendet (Verzeichnis- oder Dateiname),
+# darf sich nicht auf die Whitelist allein verlassen: sie erlaubt Punkte, weil
+# Karten- und Dateinamen sie tragen ("nature.0.2", "infolog.txt") -- damit
+# passen aber auch "." und "..", und die zeigen aus dem Zielverzeichnis heraus.
+# Deshalb hier zentral der Punkt-Guard am Segment-Anfang.
+#
+# Vorfall 2026-08-01: safe_log_segment liess ".." durch, _log_path schrieb damit
+# nach logs_dir/../<run>/ und _prune_old_runs raeumte anschliessend das
+# ELTERNverzeichnis von logs/ auf -- also Snapshots, Arrivals und Maps.
 def safe_log_segment(value: str) -> str | None:
-    if _SAFE_LOG_SEGMENT.fullmatch(value):
+    if _SAFE_LOG_SEGMENT.fullmatch(value) and not value.startswith("."):
         return value
     return None
+
+
+def safe_dir_name(value: str) -> str | None:
+    """Cell-id, die als Verzeichnisname dient (arrivals/<cell>, relay/<cell>).
+
+    Anders als bei Snapshots/Presence faengt hier keine angehaengte Endung den
+    Traversal ab, deshalb dieselbe Punkt-Regel wie bei den Log-Segmenten.
+    """
+    safe = safe_cell_id(value)
+    if safe is None or safe.startswith("."):
+        return None
+    return safe
 
 
 def atomic_write(path: Path, data: bytes) -> None:
@@ -433,21 +454,13 @@ class MapServerHandler(BaseHTTPRequestHandler):
     # koennen, ohne sich zu ueberschreiben (kein read-modify-write), eine
     # Quittung genau einen Eintrag entfernt und alles einen Serverneustart
     # ueberlebt (kein Zustand im Prozess ausser der id-Vergabe).
-    # Anders als bei Snapshots/Logs ist die Zelle hier ein VERZEICHNIS-Name.
-    # Die Whitelist erlaubt Punkte (Karten-Namen wie "nature.0.2"), deshalb
-    # muessen "." und ".." zusaetzlich raus -- sonst zeigte der Pfad aus
-    # arrivals_dir heraus (bei Snapshots faengt das angehaengte ".txt" das ab).
+    # Anders als bei Snapshots/Logs ist die Zelle hier ein VERZEICHNIS-Name,
+    # deshalb safe_dir_name statt safe_cell_id (Punkt-Guard, siehe oben).
     def _arrivals_cell_dir(self, cell_id: str) -> Path | None:
-        safe = safe_cell_id(cell_id)
-        if safe is None or safe.startswith("."):
+        safe = safe_dir_name(cell_id)
+        if safe is None:
             return None
         return self.server.arrivals_dir / safe
-
-    def _arrival_id_segment(self, arrival_id: str) -> str | None:
-        safe = safe_log_segment(arrival_id)
-        if safe is None or safe.startswith("."):
-            return None
-        return safe
 
     def _list_arrival_ids(self, cell_dir: Path) -> list[str]:
         if not cell_dir.is_dir():
@@ -472,7 +485,7 @@ class MapServerHandler(BaseHTTPRequestHandler):
             return
         if len(parts) == 2:
             cell_dir = self._arrivals_cell_dir(parts[0])
-            arrival_id = self._arrival_id_segment(parts[1])
+            arrival_id = safe_log_segment(parts[1])
             if cell_dir is None or arrival_id is None:
                 self._send_json(400, {"error": "invalid cell id or arrival id"})
                 return
@@ -547,8 +560,12 @@ class MapServerHandler(BaseHTTPRequestHandler):
     # Spielers PUTtet das komplette Startscript; der Manager startet einen
     # spring-dedicated-Prozess und antwortet mit dem UDP-Port. Beide Spieler
     # verbinden sich dann als normale Clients (IsHost=0) zu <relay-host>:<port>.
+    # safe_dir_name statt safe_cell_id: RelayManager.start legt sein
+    # Session-Verzeichnis als run_dir/<cell_id> an (relay.py) und schreibt dort
+    # script.txt/springsettings.cfg/dedicated.log -- ein "." oder ".." landete
+    # damit ausserhalb des Relay-Verzeichnisses.
     def _route_relay_session(self, cell_id: str) -> None:
-        if safe_cell_id(cell_id) is None:
+        if safe_dir_name(cell_id) is None:
             self._send_json(400, {"error": "invalid cell id"})
             return
         manager: RelayManager = self.server.relay_manager
@@ -617,13 +634,24 @@ class MapServerHandler(BaseHTTPRequestHandler):
     def _put_log(self, player: str, run_id: str, path: Path) -> None:
         body = self._read_body(MAX_LOG_BYTES)
         atomic_write(path, body)
-        self._prune_old_runs(player)
+        # Aufgeraeumt wird im Verzeichnis der eben geschriebenen Datei, NICHT
+        # ueber den Rohwert aus der URL: path stammt aus dem geprueften
+        # _log_path, path.parent.parent kann deshalb nicht aus logs_dir
+        # herauszeigen (Vorfall 2026-08-01, siehe safe_log_segment).
+        self._prune_old_runs(path.parent.parent)
         self._send_json(200, {"ok": True, "player": player, "run_id": run_id, "size": len(body)})
 
-    def _prune_old_runs(self, player: str) -> None:
-        player_dir = self.server.logs_dir / player
-        if not player_dir.is_dir():
+    def _prune_old_runs(self, player_dir: Path) -> None:
+        # Zweite Reissleine hinter der Segment-Pruefung: hier wird geloescht,
+        # also muss das Ziel nachweislich ein direktes Kind von logs_dir sein.
+        # resolve() rechnet ".." und Symlinks vorher weg.
+        try:
+            resolved = player_dir.resolve()
+            if not resolved.is_dir() or resolved.parent != self.server.logs_dir.resolve():
+                return
+        except OSError:
             return
+        player_dir = resolved
         runs = sorted(
             (entry for entry in player_dir.iterdir() if entry.is_dir()),
             key=lambda entry: entry.name,

@@ -16,6 +16,7 @@ from map_server.server import (
     ARRIVAL_ID_DIGITS,
     MAX_ARRIVAL_LINE_BYTES,
     MAX_ARRIVALS_PER_CELL,
+    MapServerHandler,
     create_server,
     next_arrival_id,
 )
@@ -216,6 +217,47 @@ class PlainServerTest(ServerTestBase):
         self.assertEqual(self._put("/logs/PC1/run/enginex", b"x")[0], 400)
         self.assertEqual(self._get("/logs/PC1/does-not-exist/engine")[0], 404)
 
+    def test_log_dot_segments_are_rejected_and_delete_nothing(self) -> None:
+        """Regression 2026-08-01 (map-server-log-path-traversal).
+
+        ".." passte auf die Segment-Whitelist (sie erlaubt Punkte fuer
+        Datei-/Kartennamen). Damit schrieb _log_path nach logs_dir/../<run>/,
+        und _prune_old_runs bekam denselben Rohwert -- es raeumte also das
+        ELTERNverzeichnis von logs/ auf und loeschte dort per rmtree alles
+        ausser den drei lexikografisch obersten Verzeichnissen. In der
+        Produktion sind das genau snapshots/, arrivals/ und maps/.
+        """
+        # Sortiert bewusst nach ganz unten: waere das Pruning noch offen, traefe
+        # es als erstes dieses Verzeichnis.
+        victim = self.logs_dir.parent / "aaa-must-survive"
+        victim.mkdir(parents=True, exist_ok=True)
+        (victim / "keep.txt").write_text("bleibt", encoding="utf-8")
+        # Ein echter Log zuerst, damit logs/ existiert wie im Betrieb.
+        self.assertEqual(self._put("/logs/PC1/20260801-100000/launcher", b"ok\n")[0], 200)
+
+        for bad in ("..", ".", "%2E%2E", "%2e"):
+            status, body = self._put(f"/logs/{bad}/20260801-100001/launcher", b"boom\n")
+            self.assertEqual(status, 400, f"player={bad}: {body!r}")
+            status, body = self._put(f"/logs/PC1/{bad}/launcher", b"boom\n")
+            self.assertEqual(status, 400, f"run_id={bad}: {body!r}")
+            self.assertEqual(self._get(f"/logs/{bad}/20260801-100000/launcher")[0], 400)
+        # Leeres Segment ebenfalls, sonst zeigte der Pfad auf logs_dir selbst.
+        self.assertEqual(self._put("/logs//20260801-100001/launcher", b"boom\n")[0], 400)
+
+        # Nichts geloescht ...
+        self.assertTrue((victim / "keep.txt").is_file())
+        self.assertTrue((self.logs_dir / "PC1" / "20260801-100000" / "launcher.log").is_file())
+        # ... und nichts ausserhalb von logs/ geschrieben.
+        self.assertFalse((self.logs_dir.parent / "20260801-100001").exists())
+
+    def test_relay_session_rejects_dot_cell_ids(self) -> None:
+        # Gleiche Fehlerklasse: RelayManager.start legt run_dir/<cell_id> an und
+        # schreibt dort script.txt/springsettings.cfg/dedicated.log.
+        for bad in ("..", ".", "%2E%2E"):
+            status, body = self._put(f"/relay/sessions/{bad}", b"HostPort=0;\n")
+            self.assertEqual(status, 400, f"cell={bad}: {body!r}")
+        self.assertFalse((self.maps_dir / "script.txt").exists())
+
     def test_log_index_lists_newest_run_first(self) -> None:
         self._put("/logs/PC1/20260725-100000/launcher", b"first\n")
         self._put("/logs/PC1/20260725-100100/launcher", b"second\n")
@@ -347,6 +389,43 @@ class PlainServerTest(ServerTestBase):
             thread.join(timeout=5)
         self.assertEqual([entry["id"] for entry in listing["arrivals"]], [arrival_id])
         self.assertEqual(listing["arrivals"][0]["line"], "unit=bleibt")
+
+
+class PruneOldRunsGuardTest(unittest.TestCase):
+    """_prune_old_runs loescht per rmtree -- es muss auch dann im logs-Verzeichnis
+    bleiben, wenn die Segment-Pruefung davor einmal versagt (zweite Reissleine).
+    """
+
+    def _handler(self, logs_dir: Path) -> MapServerHandler:
+        # Ohne Socket: _prune_old_runs braucht nur self.server.logs_dir.
+        handler = MapServerHandler.__new__(MapServerHandler)
+        handler.server = SimpleNamespace(logs_dir=logs_dir)
+        return handler
+
+    def test_refuses_everything_outside_logs_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            logs_dir = root / "logs"
+            (logs_dir / "PC1").mkdir(parents=True)
+            for name in ("arrivals", "maps", "snapshots", "presence", "relay"):
+                (root / name).mkdir()
+            handler = self._handler(logs_dir)
+            handler._prune_old_runs(logs_dir / "..")   # der alte Angriffspfad
+            handler._prune_old_runs(root)
+            handler._prune_old_runs(root / "maps")     # Geschwister von logs/
+            self.assertEqual(
+                sorted(p.name for p in root.iterdir()),
+                ["arrivals", "logs", "maps", "presence", "relay", "snapshots"],
+            )
+
+    def test_still_prunes_inside_logs_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp) / "logs"
+            player_dir = logs_dir / "PC1"
+            for run in ("r1", "r2", "r3", "r4"):
+                (player_dir / run).mkdir(parents=True)
+            self._handler(logs_dir)._prune_old_runs(player_dir)
+            self.assertEqual(sorted(p.name for p in player_dir.iterdir()), ["r2", "r3", "r4"])
 
 
 class ArrivalIdTest(unittest.TestCase):

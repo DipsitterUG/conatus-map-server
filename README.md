@@ -27,6 +27,13 @@ Mit gesetztem Secret liegen alle Pfade unter `/<secret>/…`; Clients tragen
 nur die Basis-URL inkl. Secret ein (`map-server.txt`), die Endpunkte werden
 angehaengt.
 
+**Pfad-Segmente**: `<cell_id>`, `<player>`, `<run_id>` und `<id>` sind
+Whitelist-gefiltert (`[A-Za-z0-9_.-]`) und duerfen **nicht mit `.` beginnen** —
+sonst zeigen `.` und `..` aus dem Zielverzeichnis heraus. Verstoss = `400`.
+Zusaetzlich prueft das Log-Pruning vor jedem Loeschen, dass sein Ziel ein
+direktes Kind von `logs/` ist (zwei unabhaengige Schranken, weil hier
+`rmtree` laeuft).
+
 ## Betrieb (VPS)
 
 ```bash
