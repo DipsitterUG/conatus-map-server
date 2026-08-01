@@ -1,0 +1,12 @@
+[Unit]
+Description=Conatus Map Server world-state backup timer
+
+[Timer]
+OnCalendar=daily
+# Persistent: ein VPS-Neustart ueber den Ausfuehrungszeitpunkt hinweg darf
+# keinen Tag ueberspringen.
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target

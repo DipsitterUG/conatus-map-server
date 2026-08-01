@@ -18,12 +18,16 @@ Environment=CONATUS_ARRIVALS_DIR=/srv/conatus-maps/arrivals
 Environment=CONATUS_RELAY_ENGINE_DIR=/opt/conatus-relay/engine
 Environment=CONATUS_RELAY_RUN_DIR=/srv/conatus-maps/relay
 Environment=CONATUS_RELAY_PORTS=8452-8461
-# CONATUS_MAPS_DIR / CONATUS_SNAPSHOTS_DIR / CONATUS_LOGS_DIR / CONATUS_ARRIVALS_DIR / CONATUS_PORT / CONATUS_MAP_SECRET / CONATUS_BASE_URL:
+# CONATUS_MAPS_DIR / CONATUS_SNAPSHOTS_DIR / CONATUS_LOGS_DIR / CONATUS_ARRIVALS_DIR / CONATUS_PORT / CONATUS_BASE_URL
+# sowie die Zugangsdaten CONATUS_MAP_SECRET / CONATUS_MAP_TOKENS_FILE / CONATUS_LEGACY_SECRET_SCOPE:
 EnvironmentFile=/etc/conatus-map-server.env
+# CONATUS_MAP_SECRET steht bewusst NICHT mehr in der ExecStart-Zeile: Argumente
+# landen in /proc/<pid>/cmdline und sind fuer jeden lokalen Nutzer lesbar
+# (`ps aux`). Der Server liest das Secret jetzt direkt aus der Umgebung --
+# /proc/<pid>/environ gehoert nur dem Prozessbesitzer.
 ExecStart=/usr/bin/python3 -m map_server.server \
     --maps-dir ${CONATUS_MAPS_DIR} \
     --port ${CONATUS_PORT} \
-    --secret ${CONATUS_MAP_SECRET} \
     --base-url ${CONATUS_BASE_URL} \
     --snapshots-dir ${CONATUS_SNAPSHOTS_DIR} \
     --logs-dir ${CONATUS_LOGS_DIR} \

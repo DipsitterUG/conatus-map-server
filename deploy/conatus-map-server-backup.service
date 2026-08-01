@@ -1,0 +1,8 @@
+# Taegliches Backup von snapshots/ + arrivals/ (Weltzustand).
+# Getaktet durch conatus-map-server-backup.timer.
+[Unit]
+Description=Conatus Map Server world-state backup (snapshots + arrivals)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/conatus-map-server/deploy/backup.sh

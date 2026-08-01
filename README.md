@@ -27,6 +27,45 @@ Mit gesetztem Secret liegen alle Pfade unter `/<secret>/…`; Clients tragen
 nur die Basis-URL inkl. Secret ein (`map-server.txt`), die Endpunkte werden
 angehaengt.
 
+## Zugang: Token und Pfad-Prefix
+
+Zwei Wege mit absichtlich verschiedener Reichweite:
+
+| Zugang | Wie | Reichweite | Widerruf |
+|---|---|---|---|
+| **Bearer-Token** | `Authorization: Bearer <token>` | alle Endpunkte | Zeile aus der Token-Datei loeschen — wirkt sofort, ohne Neustart |
+| **Pfad-Prefix** | `--secret` / `$CONATUS_MAP_SECRET`, `/<secret>/…` | `--legacy-secret-scope maps`: nur `/maps.json`, `/json.php`, `/maps/<datei>` | nur Rotation, trifft alle Clients |
+
+Der Prefix bleibt, weil der Engine-Downloader keinen Auth-Header setzen kann:
+`CurlWrapper::AddHeader` wird in `pr-downloader` ausschliesslich fuer
+`X-Prd-Retry-Num`, `Cache-Control` und `If-None-Match` aufgerufen, und
+`getRequestUrl` nimmt `PRD_HTTP_SEARCH_URL` roh. Er darf aber nicht mehr alles
+oeffnen: dieselbe URL landet bei jedem Download-Fehler im Engine-infolog
+(`LOG_ERROR "Error downloading %s"`), und die Clients laden ihr infolog per
+`PUT /logs/...` hierher hoch.
+
+**Token-Datei** (`--tokens-file` / `$CONATUS_MAP_TOKENS_FILE`), eine Zeile je
+Zugang, `#` ist Kommentar:
+
+```text
+<token> PC1
+<token> PC2
+```
+
+Ohne `--tokens-file` bleibt alles wie vorher: der Pfad-Prefix ist der einzige
+Zugang. Mit Token-Datei gilt:
+
+- gueltiges Token → durch, auch **ohne** Pfad-Prefix in der URL
+- `--legacy-secret-scope all` (Default, Uebergangsfenster) → der Prefix oeffnet
+  weiterhin alles
+- `--legacy-secret-scope maps` (Zielzustand) → Prefix nur noch fuer Karten,
+  alles andere `401`
+- kein Prefix und kein gueltiges Token → `404` (unveraenderte Tarnung, der
+  Server gibt sich nicht zu erkennen)
+
+Umgestellt wird erst, wenn **alle** Clients ein Token haben — der Server kennt
+sonst niemanden mehr.
+
 **Pfad-Segmente**: `<cell_id>`, `<player>`, `<run_id>` und `<id>` sind
 Whitelist-gefiltert (`[A-Za-z0-9_.-]`) und duerfen **nicht mit `.` beginnen** —
 sonst zeigen `.` und `..` aus dem Zielverzeichnis heraus. Verstoss = `400`.
@@ -42,10 +81,17 @@ sudo bash /opt/conatus-map-server/deploy/setup.sh
 ```
 
 `setup.sh` legt den `conatus`-Nutzer, `/srv/conatus-maps/maps`,
-`/etc/conatus-map-server.env` (inkl. generiertem Secret) sowie die
+`/etc/conatus-map-server.env` (inkl. generiertem Secret),
+`/etc/conatus-map-server.tokens` (zwei Zugaenge, `chmod 640`) sowie die
 systemd-Units an und startet Server + **Self-Update-Timer** (zieht alle
 5 Minuten `origin/main` und restartet nur bei Aenderung — Push hier im Repo
-= VPS aktualisiert sich selbst, wie der Content-Kanal der Spiel-PCs).
+= VPS aktualisiert sich selbst, wie der Content-Kanal der Spiel-PCs) +
+**Backup-Timer** (taeglich `snapshots/` + `arrivals/` nach
+`/var/backups/conatus-map-server`, 14 Archive Aufbewahrung).
+
+Der Self-Update-Timer zieht nur den Code. Aenderungen an `deploy/*.service`,
+`deploy/*.timer` oder neue Env-Variablen brauchen einmal
+`sudo bash /opt/conatus-map-server/deploy/setup.sh` von Hand.
 
 Karten kommen **nicht** ueber dieses Repo (grosse Binaerdateien), sondern
 per rsync vom Laptop:

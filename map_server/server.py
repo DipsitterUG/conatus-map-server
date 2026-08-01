@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
 import re
@@ -31,6 +32,117 @@ MAX_ARRIVALS_PER_CELL = 512
 # Feste Breite der id: time_ns() hat heute 19 Stellen, 20 Stellen halten die
 # lexikografische Sortierung == numerische Sortierung bis weit ins Jahr 2286.
 ARRIVAL_ID_DIGITS = 20
+
+# --- Zugang (DR-035) -------------------------------------------------------
+# Zwei Wege mit ABSICHTLICH unterschiedlicher Reichweite:
+#
+#   1. Bearer-Token im Authorization-Header. Pro PC handvergeben, serverseitig
+#      einem Namen zugeordnet, einzeln widerrufbar (Zeile aus der Token-Datei
+#      loeschen). Gilt fuer alle Endpunkte.
+#   2. Pfad-Prefix (--secret). Der einzige Weg, den der Engine-Downloader gehen
+#      KANN: pr-downloader setzt keine eigenen Auth-Header und kennt keine
+#      Konfiguration dafuer (RecoilEngine, tools/pr-downloader/src/Downloader/
+#      CurlWrapper.cpp AddHeader -- nur X-Prd-Retry-Num/Cache-Control/If-None-
+#      Match; HttpDownloader.cpp getRequestUrl nimmt PRD_HTTP_SEARCH_URL roh).
+#      Deshalb bleibt der Prefix dauerhaft bestehen -- aber nach dem
+#      Uebergangsfenster nur noch fuer die Karten-Endpunkte.
+#
+# Genau diese Aufteilung ist der Kern von DR-035: der Prefix landet
+# unvermeidbar im Engine-infolog (HttpDownloader.cpp LOG_ERROR "Error
+# downloading %s") und damit in den hochgeladenen Logs. Wer ihn sieht, kommt
+# danach trotzdem nicht mehr an den Weltzustand.
+LEGACY_SCOPE_ALL = "all"    # Uebergangsfenster: Prefix oeffnet alles (Verhalten bis 2026-08-01)
+LEGACY_SCOPE_MAPS = "maps"  # Zielzustand: Prefix oeffnet nur noch Karten-Downloads
+LEGACY_SCOPES = (LEGACY_SCOPE_ALL, LEGACY_SCOPE_MAPS)
+# Kurze Token sind kein Fehler (handvergeben), aber eine Warnung wert.
+MIN_TOKEN_LENGTH = 24
+
+
+def is_map_download_path(path: str) -> bool:
+    """Endpunkte, die der Engine-Downloader ohne Header erreichen muss."""
+    return path in ("/maps.json", "/json.php") or path.startswith("/maps/")
+
+
+def parse_tokens(text: str) -> dict[str, str]:
+    """Token-Datei -> {token: name}. Eine Zeile je Zugang: "<token> <name>".
+
+    `#` leitet einen Kommentar ein, Leerzeilen werden ignoriert. Der Name ist
+    die serverseitige Zuordnung "Schluessel -> wer" (DR-035); er taucht nirgends
+    im Protokoll auf, sondern sagt dem Betreiber, welche Zeile er loeschen muss,
+    um GENAU diesen PC auszusperren.
+    """
+    tokens: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        token = parts[0]
+        name = parts[1].strip() if len(parts) > 1 else "unnamed"
+        tokens[token] = name
+    return tokens
+
+
+class TokenStore:
+    """Token-Datei mit Nachladen bei Aenderung.
+
+    Widerrufen heisst: Zeile loeschen. Das muss ohne Serverneustart wirken,
+    sonst kostet das Aussperren eines PCs eine Downtime fuer alle. Deshalb
+    prueft jeder Request mtime+Groesse der Datei (ein stat(), wie MapIndex es
+    fuer maps.json schon macht).
+
+    Fail-closed: ist die Datei weg oder kaputt, gilt KEIN Token mehr -- nicht
+    "alle duerfen". `enabled` haengt am konfigurierten Pfad, nicht am Inhalt.
+    """
+
+    def __init__(self, path: Path | None) -> None:
+        self.path = path
+        self._tokens: dict[str, str] = {}
+        self._stamp: tuple[int, int] | None = None
+        self._error = ""
+
+    @property
+    def enabled(self) -> bool:
+        return self.path is not None
+
+    def refresh(self) -> dict[str, str]:
+        if self.path is None:
+            return {}
+        try:
+            stat = self.path.stat()
+            stamp = (stat.st_mtime_ns, stat.st_size)
+        except OSError as error:
+            self._tokens = {}
+            self._stamp = None
+            self._error = str(error)
+            return {}
+        if stamp != self._stamp:
+            try:
+                self._tokens = parse_tokens(self.path.read_text(encoding="utf-8"))
+                self._error = ""
+            except (OSError, UnicodeDecodeError) as error:
+                self._tokens = {}
+                self._error = str(error)
+            self._stamp = stamp
+        return self._tokens
+
+    def client_for(self, presented: str) -> str | None:
+        """Name hinter dem Token, oder None."""
+        if not presented:
+            return None
+        for token, name in self.refresh().items():
+            if hmac.compare_digest(token, presented):
+                return name
+        return None
+
+    def describe(self) -> str:
+        if self.path is None:
+            return "aus (kein --tokens-file)"
+        tokens = self.refresh()
+        if self._error:
+            return f"{self.path}: NICHT LESBAR ({self._error}) -- kein Token gilt"
+        names = ", ".join(sorted(set(tokens.values()))) or "leer"
+        return f"{self.path}: {len(tokens)} Zugaenge ({names})"
 
 
 def springfiles_result(entry: MapEntry, public_base: str) -> dict[str, object]:
@@ -136,8 +248,16 @@ class MapServerHandler(BaseHTTPRequestHandler):
     #   self.server.logs_dir: Path
     #   self.server.arrivals_dir: Path
     #   self.server.arrivals_lock: threading.Lock
+    #   self.server.token_store: TokenStore
+    #   self.server.legacy_secret_scope: str  (LEGACY_SCOPE_ALL | LEGACY_SCOPE_MAPS)
 
     protocol_version = "HTTP/1.1"
+
+    # Wer diesen Request geschickt hat, aufgeloest aus dem Bearer-Token
+    # ("Schluessel -> wer", DR-035). Absichtlich noch nirgends ausgegeben --
+    # Zeitstempel und Identitaet in der Log-Zeile sind Baustein
+    # diagnostics-log-platform.
+    auth_client = ""
 
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
         self._handle_request()
@@ -156,16 +276,51 @@ class MapServerHandler(BaseHTTPRequestHandler):
         except ValueError as error:
             self._send_json(400, {"error": str(error)})
 
+    def _bearer_token(self) -> str:
+        header = self.headers.get("Authorization") or ""
+        scheme, _, value = header.partition(" ")
+        if scheme.lower() != "bearer":
+            return ""
+        return value.strip()
+
+    def _authorized(self, path: str, client: str | None, prefix_ok: bool) -> bool:
+        """True = weiterrouten. Bei False ist die Antwort schon geschickt."""
+        if client is not None:
+            self.auth_client = client
+            return True
+        if not self.server.token_store.enabled:
+            # Kein Token-Betrieb konfiguriert -> unveraendertes Verhalten
+            # (Dev/LAN und der Stand vor DR-035).
+            self.auth_client = "legacy-secret" if self.server.secret else "anonymous"
+            return True
+        if prefix_ok and self.server.secret and (
+                self.server.legacy_secret_scope == LEGACY_SCOPE_ALL
+                or is_map_download_path(path)):
+            self.auth_client = "legacy-secret"
+            return True
+        self._send_json(401, {"error": "unauthorized"})
+        return False
+
     def _route(self) -> None:
         url = urlsplit(self.path)
         path = url.path
+        # Token zuerst: ein gueltiges Token kommt auch OHNE Pfad-Prefix durch.
+        # Damit braucht ein Werkzeug (oder ein spaeterer Account-Client) den
+        # Prefix gar nicht erst zu kennen.
+        client = self.server.token_store.client_for(self._bearer_token())
+        prefix_ok = True
         secret = self.server.secret
         if secret:
             prefix = "/" + secret
-            if path != prefix and not path.startswith(prefix + "/"):
+            prefix_ok = path == prefix or path.startswith(prefix + "/")
+            if prefix_ok:
+                path = path[len(prefix):] or "/"
+            elif client is None:
+                # Tarnung wie bisher: ohne Prefix und ohne Token gibt es hier nichts.
                 self._send_json(404, {"error": "not found"})
                 return
-            path = path[len(prefix):] or "/"
+        if not self._authorized(path, client, prefix_ok):
+            return
         if path == "/maps.json":
             self._serve_maps_json()
             return
@@ -686,8 +841,17 @@ class MapServerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # Die Request-Line enthaelt bei gesetztem Secret den Pfad-Prefix -- und
+    # journald ist nicht der Ort dafuer (jeder mit Journal-Lesezugriff haette
+    # sonst den Zugang). Das Bearer-Token steht im Header, nie in der
+    # Request-Line, und kann hier deshalb gar nicht auftauchen.
+    # Zeitstempel und Identitaet ergaenzt Baustein diagnostics-log-platform.
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-        print(f"[map-server] {self.client_address[0]} {format % args}", flush=True)
+        text = format % args
+        secret = getattr(self.server, "secret", None)
+        if secret:
+            text = text.replace(secret, "<secret>")
+        print(f"[map-server] {self.client_address[0]} {text}", flush=True)
 
 
 def create_server(
@@ -703,11 +867,17 @@ def create_server(
     relay_engine_dir: Path | None = None,
     relay_run_dir: Path | None = None,
     relay_ports: str = DEFAULT_PORT_RANGE,
+    tokens_file: Path | None = None,
+    legacy_secret_scope: str = LEGACY_SCOPE_ALL,
 ) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), MapServerHandler)
     server.map_index = MapIndex(maps_dir)
     server.base_url = base_url.rstrip("/") if base_url else None
     server.secret = secret.strip("/") if secret else None
+    server.token_store = TokenStore(tokens_file)
+    if legacy_secret_scope not in LEGACY_SCOPES:
+        raise ValueError(f"unknown legacy secret scope: {legacy_secret_scope}")
+    server.legacy_secret_scope = legacy_secret_scope
     server.snapshots_dir = snapshots_dir or (maps_dir.parent / "snapshots")
     server.presence_dir = presence_dir or (maps_dir.parent / "presence")
     server.logs_dir = logs_dir or (maps_dir.parent / "logs")
@@ -737,6 +907,8 @@ def serve_maps(
     relay_engine_dir: Path | None = None,
     relay_run_dir: Path | None = None,
     relay_ports: str = DEFAULT_PORT_RANGE,
+    tokens_file: Path | None = None,
+    legacy_secret_scope: str = LEGACY_SCOPE_ALL,
 ) -> None:
     maps_dir.mkdir(parents=True, exist_ok=True)
     resolved_snapshots = snapshots_dir or (maps_dir.parent / "snapshots")
@@ -762,6 +934,8 @@ def serve_maps(
         relay_engine_dir=relay_engine_dir,
         relay_run_dir=resolved_relay_run,
         relay_ports=relay_ports,
+        tokens_file=tokens_file,
+        legacy_secret_scope=legacy_secret_scope,
     )
     entries = server.map_index.refresh()
     if not (maps_dir / INDEX_FILENAME).is_file():
@@ -770,12 +944,32 @@ def serve_maps(
     print(f"[map-server] {len(entries)} Karten in {maps_dir}", flush=True)
     for entry in entries:
         print(f"[map-server]   {entry.springname} ({entry.filename}, {entry.size} bytes)", flush=True)
-    prefix = ("/" + server.secret) if server.secret else ""
+    # Prefix NICHT ausdrucken -- diese Zeile landet in journald.
+    prefix = "/<secret>" if server.secret else ""
     print(f"[map-server] lauscht auf http://{host}:{port}{prefix} "
           f"(maps.json | json.php?category=map&springname=... | maps/<datei> | "
           f"snapshots/<cell> | presence/<cell> | arrivals/<cell>[/<id>] | "
           f"logs | logs/<player>/<run>/<kind> | "
           f"relay/health | relay/sessions[/<cell>])", flush=True)
+    print(f"[map-server] token-auth: {server.token_store.describe()}", flush=True)
+    for token, name in sorted(server.token_store.refresh().items(), key=lambda item: item[1]):
+        if len(token) < MIN_TOKEN_LENGTH:
+            print(f"[map-server]   WARNUNG: Token fuer '{name}' ist kuerzer als "
+                  f"{MIN_TOKEN_LENGTH} Zeichen", flush=True)
+    if tokens_file is not None:
+        try:
+            mode = tokens_file.stat().st_mode & 0o077
+        except OSError:
+            mode = 0
+        if mode:
+            print(f"[map-server]   WARNUNG: {tokens_file} ist fuer Gruppe/andere "
+                  f"lesbar -- chmod 640 und chown root:conatus", flush=True)
+    scope_note = ("Pfad-Prefix oeffnet noch ALLES (Uebergangsfenster) -- nach dem "
+                  "Rollout auf --legacy-secret-scope maps umstellen"
+                  if server.legacy_secret_scope == LEGACY_SCOPE_ALL
+                  else "Pfad-Prefix oeffnet nur noch die Karten-Endpunkte")
+    print(f"[map-server] legacy-secret-scope={server.legacy_secret_scope}: {scope_note}",
+          flush=True)
     relay_state = ("bereit, engine=" + str(relay_engine_dir)
                    if server.relay_manager.dedicated_ready()
                    else "OHNE dedicated-Binary (health meldet dedicated_ready=false)")
@@ -804,8 +998,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--base-url", default=None,
                         help="Oeffentliche Basis-URL ohne Secret (z.B. http://maps.example.org:8605)")
-    parser.add_argument("--secret", default=None,
-                        help="Pfad-Prefix als Minimal-Zugriffsschutz (Clients haengen ihn an die URL)")
+    # Bewusst KEIN --secret in der systemd-ExecStart-Zeile: Argumente stehen in
+    # /proc/<pid>/cmdline und sind fuer jeden lokalen Nutzer lesbar. Die
+    # Umgebung (/proc/<pid>/environ) gehoert dagegen nur dem Prozessbesitzer,
+    # deshalb ist CONATUS_MAP_SECRET der Normalweg und --secret nur noch fuer
+    # Dev/Tests da.
+    parser.add_argument("--secret", default=os.environ.get("CONATUS_MAP_SECRET") or None,
+                        help="Pfad-Prefix als Karten-Download-Zugang (Default: $CONATUS_MAP_SECRET; "
+                             "nicht auf der Kommandozeile uebergeben, das landet in /proc/<pid>/cmdline)")
+    parser.add_argument("--tokens-file", type=Path,
+                        default=(Path(os.environ["CONATUS_MAP_TOKENS_FILE"])
+                                 if os.environ.get("CONATUS_MAP_TOKENS_FILE") else None),
+                        help="Datei mit '<token> <name>' je Zeile (Default: $CONATUS_MAP_TOKENS_FILE). "
+                             "Ohne sie bleibt der Pfad-Prefix der einzige Zugang.")
+    parser.add_argument("--legacy-secret-scope", choices=LEGACY_SCOPES,
+                        default=os.environ.get("CONATUS_LEGACY_SECRET_SCOPE") or LEGACY_SCOPE_ALL,
+                        help="Reichweite des Pfad-Prefix, sobald Token konfiguriert sind: "
+                             "'all' = Uebergangsfenster (oeffnet alles), "
+                             "'maps' = Zielzustand (nur Karten-Downloads, alles andere braucht Token)")
     parser.add_argument("--relay-engine-dir", type=Path, default=None,
                         help="Verzeichnis mit spring-dedicated + base/ (fehlt es, meldet "
                              "/relay/health dedicated_ready=false)")
@@ -819,7 +1029,9 @@ def main(argv: list[str] | None = None) -> int:
                host=args.host, port=args.port,
                base_url=args.base_url, secret=args.secret,
                relay_engine_dir=args.relay_engine_dir, relay_run_dir=args.relay_run_dir,
-               relay_ports=args.relay_ports)
+               relay_ports=args.relay_ports,
+               tokens_file=args.tokens_file,
+               legacy_secret_scope=args.legacy_secret_scope)
     return 0
 
 

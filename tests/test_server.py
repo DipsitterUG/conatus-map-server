@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import tempfile
 import threading
@@ -14,11 +16,14 @@ from types import SimpleNamespace
 from map_server.index import MapIndex
 from map_server.server import (
     ARRIVAL_ID_DIGITS,
+    LEGACY_SCOPE_ALL,
+    LEGACY_SCOPE_MAPS,
     MAX_ARRIVAL_LINE_BYTES,
     MAX_ARRIVALS_PER_CELL,
     MapServerHandler,
     create_server,
     next_arrival_id,
+    parse_tokens,
 )
 
 
@@ -63,14 +68,22 @@ class MapIndexTest(unittest.TestCase):
 class ServerTestBase(unittest.TestCase):
     base_url: str | None = None
     secret: str | None = None
+    tokens: str | None = None          # Inhalt der Token-Datei, None = keine
+    legacy_secret_scope: str = LEGACY_SCOPE_ALL
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         maps_dir = Path(self._tmp.name)
         _write_fixture(maps_dir)
+        self.tokens_file: Path | None = None
+        if self.tokens is not None:
+            self.tokens_file = maps_dir / "tokens.txt"
+            self.tokens_file.write_text(self.tokens, encoding="utf-8")
         self.server = create_server(
             maps_dir, host="127.0.0.1", port=0,
             base_url=self.base_url, secret=self.secret,
+            tokens_file=self.tokens_file,
+            legacy_secret_scope=self.legacy_secret_scope,
             # Explizit isoliert im Test-Tempdir: der Default (maps_dir.parent / "logs")
             # zielt in der Produktion auf ein Geschwisterverzeichnis von "maps/", trifft
             # hier aber das geteilte /tmp, weil maps_dir selbst schon das Tempdir ist.
@@ -93,21 +106,14 @@ class ServerTestBase(unittest.TestCase):
         self.thread.join(timeout=5)
         self._tmp.cleanup()
 
-    def _get(self, path: str) -> tuple[int, bytes]:
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}") as response:
-                return response.status, response.read()
-        except urllib.error.HTTPError as error:
-            body = error.read()
-            error.close()
-            return error.code, body
+    @staticmethod
+    def _auth(token: str | None) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"} if token else {}
 
-    def _put(self, path: str, data: bytes, content_type: str = "text/plain") -> tuple[int, bytes]:
+    def _get(self, path: str, token: str | None = None) -> tuple[int, bytes]:
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.port}{path}",
-            data=data,
-            method="PUT",
-            headers={"Content-Type": content_type},
+            headers=self._auth(token),
         )
         try:
             with urllib.request.urlopen(request) as response:
@@ -117,10 +123,27 @@ class ServerTestBase(unittest.TestCase):
             error.close()
             return error.code, body
 
-    def _delete(self, path: str) -> tuple[int, bytes]:
+    def _put(self, path: str, data: bytes, content_type: str = "text/plain",
+             token: str | None = None) -> tuple[int, bytes]:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=data,
+            method="PUT",
+            headers={"Content-Type": content_type, **self._auth(token)},
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            error.close()
+            return error.code, body
+
+    def _delete(self, path: str, token: str | None = None) -> tuple[int, bytes]:
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.port}{path}",
             method="DELETE",
+            headers=self._auth(token),
         )
         try:
             with urllib.request.urlopen(request) as response:
@@ -468,6 +491,136 @@ class SecretAndBaseUrlTest(ServerTestBase):
             result["mirrors"][0],
             "http://maps.example.org:8605/geheim123/maps/cell-a1.sd7",
         )
+
+
+PC1_TOKEN = "tok-pc1-0123456789abcdef0123456789"
+PC2_TOKEN = "tok-pc2-fedcba9876543210fedcba9876"
+TOKENS_FILE = f"""# Zugaenge (DR-035): eine Zeile je PC, Widerruf = Zeile loeschen.
+{PC1_TOKEN} PC1
+{PC2_TOKEN}  PC2
+
+# auskommentiert = gesperrt
+# tok-alt-0000000000000000000000000 PC-alt
+"""
+
+
+class ParseTokensTest(unittest.TestCase):
+    def test_maps_token_to_name_and_ignores_comments(self) -> None:
+        tokens = parse_tokens(TOKENS_FILE)
+        self.assertEqual(tokens, {PC1_TOKEN: "PC1", PC2_TOKEN: "PC2"})
+
+    def test_token_without_name_still_works(self) -> None:
+        self.assertEqual(parse_tokens("abc\n"), {"abc": "unnamed"})
+
+
+class TokenAuthTest(ServerTestBase):
+    """Uebergangsfenster: Token gelten, der alte Pfad-Prefix aber auch.
+
+    Ohne dieses Fenster sperrt der Umbau beide Spieler-PCs aus -- der Server
+    kennt nur ein Secret und die Launcher kommen erst per Release nach.
+    """
+
+    base_url = "http://maps.example.org:8605"
+    secret = "geheim123"
+    tokens = TOKENS_FILE
+    legacy_secret_scope = LEGACY_SCOPE_ALL
+
+    def test_valid_token_works_without_the_path_prefix(self) -> None:
+        # Ein Werkzeug mit Token braucht den Prefix gar nicht zu kennen.
+        self.assertEqual(self._get("/maps.json", token=PC1_TOKEN)[0], 200)
+        self.assertEqual(self._put("/snapshots/map_0_0", b"schema=2\n", token=PC2_TOKEN)[0], 200)
+
+    def test_valid_token_also_works_with_the_path_prefix(self) -> None:
+        # Der Launcher behaelt seine URL und haengt nur den Header an --
+        # deshalb muss beides gleichzeitig gelten.
+        self.assertEqual(self._get("/geheim123/maps.json", token=PC1_TOKEN)[0], 200)
+
+    def test_wrong_or_missing_token_falls_back_to_the_prefix(self) -> None:
+        self.assertEqual(self._get("/geheim123/maps.json")[0], 200)
+        self.assertEqual(self._get("/geheim123/maps.json", token="falsch")[0], 200)
+        # Ohne Prefix und ohne gueltiges Token: getarnt als 404, wie bisher.
+        self.assertEqual(self._get("/maps.json")[0], 404)
+        self.assertEqual(self._get("/maps.json", token="falsch")[0], 404)
+
+    def test_token_revocation_takes_effect_without_restart(self) -> None:
+        # Aussperren eines PCs darf keine Downtime fuer die anderen kosten.
+        self.assertEqual(self._get("/maps.json", token=PC2_TOKEN)[0], 200)
+        assert self.tokens_file is not None
+        self.tokens_file.write_text(f"{PC1_TOKEN} PC1\n", encoding="utf-8")
+        self.assertEqual(self._get("/maps.json", token=PC2_TOKEN)[0], 404)
+        self.assertEqual(self._get("/maps.json", token=PC1_TOKEN)[0], 200)
+
+    def test_unreadable_token_file_locks_tokens_out_instead_of_opening_up(self) -> None:
+        assert self.tokens_file is not None
+        self.tokens_file.unlink()
+        self.assertEqual(self._get("/maps.json", token=PC1_TOKEN)[0], 404)
+        # Der Prefix traegt den Betrieb weiter -- fail-closed, nicht fail-open.
+        self.assertEqual(self._get("/geheim123/maps.json")[0], 200)
+
+    def test_server_resolves_who_is_behind_a_token(self) -> None:
+        # "Schluessel -> wer" (DR-035): die Zuordnung liegt serverseitig.
+        store = self.server.token_store
+        self.assertEqual(store.client_for(PC1_TOKEN), "PC1")
+        self.assertEqual(store.client_for(PC2_TOKEN), "PC2")
+        self.assertIsNone(store.client_for("falsch"))
+        self.assertIsNone(store.client_for(""))
+
+
+class TokenOnlyScopeTest(ServerTestBase):
+    """Zielzustand nach dem Rollout: der Pfad-Prefix oeffnet nur noch Karten.
+
+    Grund: der Engine-Downloader kann keinen Header setzen (verifiziert in
+    RecoilEngine pr-downloader), gleichzeitig faellt genau dieser Prefix bei
+    jedem Download-Fehler ins Engine-infolog. Er darf deshalb nicht laenger
+    den Weltzustand oeffnen.
+    """
+
+    secret = "geheim123"
+    tokens = TOKENS_FILE
+    legacy_secret_scope = LEGACY_SCOPE_MAPS
+
+    def test_map_endpoints_stay_open_for_the_engine_downloader(self) -> None:
+        self.assertEqual(self._get("/geheim123/maps.json")[0], 200)
+        self.assertEqual(self._get("/geheim123/maps/cell-a1.sd7")[0], 200)
+        status, body = self._get("/geheim123/json.php?category=map&springname=Cell%20A1%200.1")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)[0]["springname"], "Cell A1 0.1")
+
+    def test_world_state_needs_a_token(self) -> None:
+        for path in ("/geheim123/snapshots/map_0_0", "/geheim123/presence/map_0_0",
+                     "/geheim123/arrivals/map_0_1", "/geheim123/logs",
+                     "/geheim123/relay/health"):
+            self.assertEqual(self._get(path)[0], 401, path)
+            self.assertEqual(self._get(path, token="falsch")[0], 401, path)
+        self.assertEqual(self._put("/geheim123/snapshots/map_0_0", b"schema=2\n")[0], 401)
+        self.assertEqual(self._delete("/geheim123/presence/map_0_0")[0], 401)
+
+    def test_valid_token_gets_through(self) -> None:
+        self.assertEqual(self._put("/geheim123/snapshots/map_0_0", b"schema=2\n",
+                                   token=PC1_TOKEN)[0], 200)
+        self.assertEqual(self._get("/geheim123/snapshots/map_0_0", token=PC1_TOKEN)[0], 200)
+        self.assertEqual(self._get("/relay/health", token=PC2_TOKEN)[0], 200)
+        self.assertEqual(self._get("/logs", token=PC2_TOKEN)[0], 200)
+
+    def test_401_says_nothing_about_which_part_was_wrong(self) -> None:
+        _, body = self._get("/geheim123/snapshots/map_0_0", token="falsch")
+        self.assertEqual(json.loads(body), {"error": "unauthorized"})
+
+
+class SecretRedactionTest(ServerTestBase):
+    secret = "geheim123"
+
+    def test_request_line_is_logged_without_the_secret(self) -> None:
+        # journald darf den Zugang nicht mitschreiben.
+        handler = MapServerHandler.__new__(MapServerHandler)
+        handler.server = SimpleNamespace(secret="geheim123")
+        handler.client_address = ("10.0.0.2", 1234)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            handler.log_message('"%s" %s -', "GET /geheim123/maps.json HTTP/1.1", "200")
+        printed = buffer.getvalue()
+        self.assertNotIn("geheim123", printed)
+        self.assertIn("/<secret>/maps.json", printed)
 
 
 class _FakeRelayManager:
